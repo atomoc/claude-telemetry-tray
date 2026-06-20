@@ -39,7 +39,7 @@ from datetime import datetime
 SCRIPT = os.path.abspath(__file__)
 SYS = platform.system()
 REFRESH_INTERVAL = 5
-__version__ = "2.3"
+__version__ = "2.4"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",

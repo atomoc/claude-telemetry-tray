@@ -37,23 +37,80 @@ PAYLOAD_FILES = [
 ]
 
 WIN_HEADER = r'''@echo off
-setlocal
+setlocal enableextensions
 cd /d "%~dp0"
-echo Installing Claude Telemetry Tray...
+echo ===================================================
+echo   Claude Telemetry Tray - installer (Windows)
+echo ===================================================
+echo.
+
+call :findpy
+if defined PY goto havepy
+echo Python 3 not found. Installing automatically (no admin needed)...
+where winget >nul 2>&1 && winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements
+call :findpy
+if defined PY goto havepy
+echo Downloading the official Python installer from python.org ...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; try { Invoke-WebRequest -UseBasicParsing -Uri 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe' -OutFile (Join-Path $env:TEMP 'python-setup.exe') } catch { exit 1 }"
+if exist "%TEMP%\python-setup.exe" "%TEMP%\python-setup.exe" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1
+del "%TEMP%\python-setup.exe" >nul 2>&1
+call :findpy
+if defined PY goto havepy
+echo [ERROR] Could not install Python automatically.
+echo Install Python 3 from https://www.python.org/downloads/ and run this file again.
+pause
+exit /b 1
+
+:havepy
+echo Using Python: %PY%
+echo.
+echo Unpacking files...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=Get-Content -LiteralPath '%~f0' -Raw; $i=$s.LastIndexOf('__CTB64__'); $b=($s.Substring($i+9)) -replace '\s',''; $bytes=[Convert]::FromBase64String($b); $zip=Join-Path $env:TEMP ('ct_'+[guid]::NewGuid().ToString()+'.zip'); [IO.File]::WriteAllBytes($zip,$bytes); Expand-Archive -LiteralPath $zip -DestinationPath '%~dp0' -Force; Remove-Item $zip -Force; Get-ChildItem -LiteralPath (Join-Path '%~dp0' 'claude-telemetry') -Recurse -File | Unblock-File"
-if errorlevel 1 ( echo [ERROR] Unpacking failed. & pause & exit /b 1 )
+if errorlevel 1 goto unpackfail
+
+set "APP=%~dp0claude-telemetry\claude-telemetry-tray.py"
+echo Installing dependencies (pystray, Pillow)...
+"%PY%" -m pip install --user --upgrade pystray Pillow
+if errorlevel 1 goto depsfail
+echo Enabling auto-start at login...
+"%PY%" "%APP%" --enable-autostart
+
+set "PYW="
+set "MAYBE=%PY:python.exe=pythonw.exe%"
+if exist "%MAYBE%" set "PYW=%MAYBE%"
+if not defined PYW for /d %%D in ("%LocalAppData%\Programs\Python\Python3*") do if exist "%%D\pythonw.exe" set "PYW=%%D\pythonw.exe"
+if not defined PYW where pythonw >nul 2>&1 && set "PYW=pythonw"
+if not defined PYW set "PYW=%PY%"
+
+echo Creating Desktop shortcut...
+set "TGT=%APP%"
+set "LNKEXE=%PYW%"
+powershell -NoProfile -Command "$ws=New-Object -ComObject WScript.Shell;$d=[Environment]::GetFolderPath('Desktop');$lnk=$ws.CreateShortcut((Join-Path $d 'Claude Telemetry.lnk'));$lnk.TargetPath=$env:LNKEXE;$lnk.Arguments=([char]34+$env:TGT+[char]34);$lnk.WorkingDirectory=(Split-Path $env:TGT);$lnk.Save()" 2>nul
+
+echo Starting tray...
+start "" "%PYW%" "%APP%"
+echo Done. Tray icon is near the clock (maybe under the hidden-icons arrow).
+exit /b
+
+:unpackfail
+echo [ERROR] Unpacking failed.
+pause
+exit /b 1
+:depsfail
+echo [ERROR] Dependency install failed.
+pause
+exit /b 1
+
+:findpy
 set "PY="
 where py >nul 2>&1 && set "PY=py"
-if not defined PY ( where python >nul 2>&1 && set "PY=python" )
-if not defined PY ( echo [ERROR] Python not found. Install from python.org with "Add to PATH". & pause & exit /b 1 )
-set "APP=%~dp0claude-telemetry\claude-telemetry-tray.py"
-%PY% -m pip install --user --upgrade pystray Pillow
-if errorlevel 1 ( echo [ERROR] Dependency install failed. & pause & exit /b 1 )
-%PY% "%APP%" --enable-autostart
-set "TGT=%APP%"
-powershell -NoProfile -Command "$ws=New-Object -ComObject WScript.Shell;$d=[Environment]::GetFolderPath('Desktop');$lnk=$ws.CreateShortcut((Join-Path $d 'Claude Telemetry.lnk'));$pw=(Get-Command pythonw -ErrorAction SilentlyContinue).Source;if(-not $pw){$pw=(Get-Command python -ErrorAction SilentlyContinue).Source};$lnk.TargetPath=$pw;$lnk.Arguments=([char]34+$env:TGT+[char]34);$lnk.WorkingDirectory=(Split-Path $env:TGT);$lnk.Save()" 2>nul
-where pythonw >nul 2>&1 && ( start "" pythonw "%APP%" ) || ( start "" %PY% "%APP%" )
-exit /b
+if defined PY goto :eof
+where python >nul 2>&1 && set "PY=python"
+if defined PY goto :eof
+for /d %%D in ("%LocalAppData%\Programs\Python\Python3*") do if exist "%%D\python.exe" set "PY=%%D\python.exe"
+if defined PY goto :eof
+for /d %%D in ("%ProgramFiles%\Python3*") do if exist "%%D\python.exe" set "PY=%%D\python.exe"
+goto :eof
 __CTB64__
 '''
 

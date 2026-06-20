@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build output
+dist/
+*.zip
+
+# Local runtime / secrets (never commit your token or logs)
+config.json
+*.log
+*.log.1
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini

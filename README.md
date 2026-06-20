@@ -90,7 +90,7 @@ Cloning with Git does **not** apply the OS "downloaded from the Internet" mark, 
 gets blocked.
 
 ```bash
-git clone https://github.com/<you>/claude-telemetry-tray.git
+git clone https://github.com/atomoc/claude-telemetry-tray.git
 cd claude-telemetry-tray
 python3 claude-telemetry-tray.py        # macOS/Linux
 # Windows: double-click start-tray-windows.bat

@@ -72,6 +72,14 @@ print("Extracted to:", sys.argv[2]+"/claude-telemetry")
 PY
 chmod +x "$DIR/claude-telemetry/start-tray-mac-linux.sh" 2>/dev/null || true
 command -v xattr >/dev/null 2>&1 && xattr -dr com.apple.quarantine "$DIR/claude-telemetry" 2>/dev/null || true
+if [ "$(uname)" = "Linux" ] && command -v apt-get >/dev/null 2>&1; then
+  echo "Setting up tray support on Debian/Ubuntu (may ask for your password)..."
+  sudo apt-get update -y >/dev/null 2>&1 || true
+  sudo apt-get install -y python3-tk python3-gi gir1.2-ayatanaappindicator3-0.1 gnome-shell-extension-appindicator >/dev/null 2>&1 \\
+    || sudo apt-get install -y python3-tk python3-gi gir1.2-appindicator3-0.1 gnome-shell-extension-appindicator >/dev/null 2>&1 || true
+  gnome-extensions enable ubuntu-appindicators@ubuntu.com 2>/dev/null \\
+    || gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com 2>/dev/null || true
+fi
 APP="$DIR/claude-telemetry/claude-telemetry-tray.py"
 python3 -m pip install --user --upgrade pystray Pillow >/dev/null 2>&1 || \
   python3 -m pip install --user --break-system-packages --upgrade pystray Pillow >/dev/null 2>&1 || true
@@ -82,6 +90,7 @@ if [ "$(uname)" = "Darwin" ]; then
 else
   nohup python3 "$APP" >/dev/null 2>&1 &
   echo "Done. Tray started and will auto-start at every login."
+  echo "On GNOME you may need to log out and back in once for the tray icon to appear."
 fi
 exit 0
 __CTB64__

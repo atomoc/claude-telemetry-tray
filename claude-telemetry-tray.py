@@ -39,7 +39,7 @@ from datetime import datetime
 SCRIPT = os.path.abspath(__file__)
 SYS = platform.system()
 REFRESH_INTERVAL = 5
-__version__ = "2.2"
+__version__ = "2.3"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     "logUserPrompts": True,
     "logTelemetry": True,   # писать тело отправляемой телеметрии в лог-файл
     "proxyPort": 4318,
+    "scope": "user",   # "user" = ~/.claude/settings.json (без админа); "system" = managed (нужен админ)
 }
 
 PROXY_STATE = {"ok": None, "detail": "трафика ещё не было", "bound": False}
@@ -151,7 +152,7 @@ def build_env(cfg):
 
 
 def do_enable(cfg):
-    f = managed_file()
+    f = managed_file() if cfg.get("scope") == "system" else user_file()
     os.makedirs(os.path.dirname(f), exist_ok=True)
     settings = read_json(f) or {}
     env = settings.get("env") or {}
@@ -222,8 +223,10 @@ def status_text():
             lines.append("  %s: ВКЛ → %s%s" % (
                 label, st["endpoint"],
                 "  [+ЛОГ ПРОМПТОВ]" if st["prompts"] else ""))
-    acct = (load_config().get("account") or "").strip()
+    cfg = load_config()
+    acct = (cfg.get("account") or "").strip()
     lines.append("")
+    lines.append("  Режим: " + ("на всю систему (managed)" if cfg.get("scope") == "system" else "только мой пользователь"))
     lines.append("  Фильтр аккаунта: " + (acct if acct else "выкл (отправляется всё)"))
     return "\n".join(lines)
 
@@ -421,6 +424,9 @@ def run_elevated(extra_args):
 
 
 def elevate_enable(cfg):
+    if cfg.get("scope") != "system":   # user-scope: без прав админа
+        do_enable(cfg)
+        return True
     if is_admin():
         do_enable(cfg)
         return True
@@ -431,6 +437,9 @@ def elevate_enable(cfg):
 
 
 def elevate_disable():
+    if not file_state(managed_file()).get("on"):   # только пользовательский файл — без админа
+        do_disable(managed_file(), user_file())
+        return True
     if is_admin():
         do_disable(managed_file(), user_file())
         return True
@@ -575,7 +584,11 @@ def run_settings_window():
 
     logtel_var = tk.BooleanVar(value=bool(cfg.get("logTelemetry", True)))
     ttk.Checkbutton(frm, text="Логировать отправляемую телеметрию в файл",
-                    variable=logtel_var).pack(anchor="w", pady=(0, 14))
+                    variable=logtel_var).pack(anchor="w", pady=(0, 4))
+
+    scope_var = tk.BooleanVar(value=(cfg.get("scope") == "system"))
+    ttk.Checkbutton(frm, text="Применять на всю систему (нужен админ; пользователь не отключит)",
+                    variable=scope_var).pack(anchor="w", pady=(0, 14))
 
     def save():
         port = port_var.get().strip()
@@ -590,6 +603,7 @@ def run_settings_window():
             "logUserPrompts": bool(prompts_var.get()),
             "logTelemetry": bool(logtel_var.get()),
             "proxyPort": int(port),
+            "scope": "system" if scope_var.get() else "user",
         }
         if not new["token"]:
             messagebox.showwarning("Внимание", "Токен не указан.")
@@ -598,7 +612,7 @@ def run_settings_window():
             messagebox.showwarning("Внимание", "Базовый URL не указан.")
             return
         save_config(new)
-        if file_state(managed_file()).get("on"):
+        if is_on():
             ok = elevate_enable(new)
             if ok:
                 messagebox.showinfo("Сохранено",
@@ -770,8 +784,17 @@ def tray_main():
     try:
         icon.run(setup)
     except Exception:
-        log_line("ОШИБКА трея:\n" + traceback.format_exc())
-        raise
+        log_line("значок трея недоступен, работаю без значка:\n" + traceback.format_exc())
+        try:
+            if not PROXY_STATE.get("bound"):
+                start_proxy()
+        except Exception:
+            pass
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
     log_line("трей остановлен")
 
 

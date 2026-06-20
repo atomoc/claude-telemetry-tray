@@ -79,8 +79,10 @@ OTEL_RESOURCE_ATTRIBUTES=team.id=<teamId>
 
 - **Python 3.8+** (on Windows tick *"Add python.exe to PATH"* during install).
 - `pystray` and `Pillow` — installed automatically on first run.
-- A GUI toolkit for the settings window: **Tkinter** (bundled with python.org builds; on
-  Debian/Ubuntu: `sudo apt install python3-tk`).
+- A GUI toolkit for the settings window (**Tkinter**) and a tray backend. The installers
+  set these up automatically — on Debian/Ubuntu they `apt install` `python3-tk`,
+  `python3-gi`, `gir1.2-ayatanaappindicator3-0.1` and the GNOME AppIndicator extension and
+  enable it. On GNOME you may need to log out/in once so the shell shows the tray icon.
 
 ## Install
 
@@ -113,8 +115,8 @@ Right-click (or click) the tray icon:
 
 | Menu item | What it does |
 |---|---|
-| **Enable / Disable** | Writes/clears Claude Code managed settings (asks for admin) |
-| **Settings…** | Token, collector URL, **account filter**, Team ID, proxy port, logging toggles |
+| **Enable / Disable** | Turns telemetry on/off. By default writes your **user** settings (no admin). Tick **Apply system-wide** in Settings for enforced managed settings (admin). |
+| **Settings…** | Token, collector URL, **account filter**, Team ID, proxy port, logging, and **Apply system-wide** scope |
 | **Start at login** | Toggle auto-start |
 | **Status** | Current state + last delivery result |
 | **Quit** | Exit |

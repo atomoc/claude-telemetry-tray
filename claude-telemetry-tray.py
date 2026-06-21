@@ -39,7 +39,7 @@ from datetime import datetime
 SCRIPT = os.path.abspath(__file__)
 SYS = platform.system()
 REFRESH_INTERVAL = 5
-__version__ = "2.4"
+__version__ = "2.5"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -546,7 +546,7 @@ def set_autostart(on):
 def run_settings_window():
     try:
         import tkinter as tk
-        from tkinter import ttk, messagebox
+        from tkinter import ttk, messagebox, filedialog
     except Exception:
         sys.stderr.write("Tkinter недоступен. На Linux установи пакет python3-tk.\n")
         return
@@ -554,6 +554,52 @@ def run_settings_window():
     root = tk.Tk()
     root.title("Claude Telemetry — настройки")
     root.resizable(False, False)
+
+    # --- Буфер обмена: правый клик + Ctrl/Cmd по КОДУ клавиши (не зависит от раскладки) ---
+    _clip = tk.Menu(root, tearoff=0)
+
+    def _clip_do(ev):
+        w = getattr(_clip, "_t", None)
+        if w is not None:
+            w.event_generate(ev)
+
+    _clip.add_command(label="Вырезать", command=lambda: _clip_do("<<Cut>>"))
+    _clip.add_command(label="Копировать", command=lambda: _clip_do("<<Copy>>"))
+    _clip.add_command(label="Вставить", command=lambda: _clip_do("<<Paste>>"))
+    _clip.add_separator()
+    _clip.add_command(label="Выделить всё", command=lambda: _clip_do("<<SelectAll>>"))
+
+    def _clip_popup(e):
+        _clip._t = e.widget
+        try:
+            _clip.tk_popup(e.x_root, e.y_root)
+        finally:
+            _clip.grab_release()
+        return "break"
+
+    if SYS == "Windows":
+        _kc = {86: "<<Paste>>", 67: "<<Copy>>", 88: "<<Cut>>", 65: "<<SelectAll>>"}
+    elif SYS == "Darwin":
+        _kc = {9: "<<Paste>>", 8: "<<Copy>>", 7: "<<Cut>>", 0: "<<SelectAll>>"}
+    else:
+        _kc = {55: "<<Paste>>", 54: "<<Copy>>", 53: "<<Cut>>", 38: "<<SelectAll>>"}
+
+    def _on_mod_key(e):
+        act = _kc.get(e.keycode)
+        if act:
+            e.widget.event_generate(act)
+            return "break"
+        return None
+
+    for _cls in ("TEntry", "Entry"):
+        root.bind_class(_cls, "<Button-3>", _clip_popup)
+        root.bind_class(_cls, "<Button-2>", _clip_popup)
+        root.bind_class(_cls, "<Control-KeyPress>", _on_mod_key)
+        try:
+            root.bind_class(_cls, "<Command-KeyPress>", _on_mod_key)
+        except Exception:
+            pass
+
     frm = ttk.Frame(root, padding=16)
     frm.pack(fill="both", expand=True)
 
@@ -627,10 +673,71 @@ def run_settings_window():
                                 "Настройки сохранены.\nНажми «Включить» в трее, чтобы применить.")
         root.destroy()
 
+    def do_import():
+        path = filedialog.askopenfilename(
+            title="Импорт настроек",
+            filetypes=[("Конфиг JSON", "*.json"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Импорт", "Не удалось прочитать файл:\n%s" % e)
+            return
+        if not isinstance(data, dict):
+            messagebox.showerror("Импорт", "Файл не похож на конфиг (ожидался JSON-объект).")
+            return
+        if "token" in data:
+            token_var.set(str(data.get("token", "")))
+        if "base" in data:
+            base_var.set(str(data.get("base", "")))
+        if "account" in data:
+            acct_var.set(str(data.get("account", "")))
+        if "teamId" in data:
+            team_var.set(str(data.get("teamId", "")))
+        if "proxyPort" in data:
+            port_var.set(str(data.get("proxyPort", "")))
+        if "logUserPrompts" in data:
+            prompts_var.set(bool(data.get("logUserPrompts")))
+        if "logTelemetry" in data:
+            logtel_var.set(bool(data.get("logTelemetry")))
+        if "scope" in data:
+            scope_var.set(data.get("scope") == "system")
+        messagebox.showinfo("Импорт", "Настройки загружены из файла.\nПроверь значения и нажми «Сохранить».")
+
+    def do_export():
+        path = filedialog.asksaveasfilename(
+            title="Экспорт настроек", defaultextension=".json",
+            initialfile="claude-telemetry-config.json",
+            filetypes=[("Конфиг JSON", "*.json")])
+        if not path:
+            return
+        port = port_var.get().strip()
+        cur = {
+            "token": token_var.get().strip(),
+            "base": base_var.get().strip().rstrip("/"),
+            "account": acct_var.get().strip(),
+            "teamId": team_var.get().strip(),
+            "logUserPrompts": bool(prompts_var.get()),
+            "logTelemetry": bool(logtel_var.get()),
+            "proxyPort": int(port) if port.isdigit() else 4318,
+            "scope": "system" if scope_var.get() else "user",
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cur, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            messagebox.showinfo("Экспорт", "Настройки сохранены в файл.")
+        except Exception as e:
+            messagebox.showerror("Экспорт", "Не удалось сохранить:\n%s" % e)
+
     btns = ttk.Frame(frm)
     btns.pack(fill="x")
     ttk.Button(btns, text="Сохранить", command=save).pack(side="right")
     ttk.Button(btns, text="Отмена", command=root.destroy).pack(side="right", padx=(0, 8))
+    ttk.Button(btns, text="Импорт…", command=do_import).pack(side="left")
+    ttk.Button(btns, text="Экспорт…", command=do_export).pack(side="left", padx=(8, 0))
     root.update_idletasks()
     root.mainloop()
 
@@ -690,7 +797,8 @@ def tray_main():
     import pystray
     from pystray import Menu, MenuItem
 
-    state = {"value": compute_state()}
+    state = {"value": compute_state(), "settings": None}
+    settings_lock = threading.Lock()
     titles = {
         "on": "Claude Telemetry: ВКЛ, доставка идёт",
         "off": "Claude Telemetry: выключено",
@@ -744,8 +852,28 @@ def tray_main():
         notify(icon, "Телеметрия отключена. Перезапусти терминалы и IDE."
                if ok else "Не удалось отключить (отклонены права?).")
 
+    last_click = {"t": 0.0}
+
+    def open_settings(icon):
+        with settings_lock:
+            p = state.get("settings")
+            if p is not None and p.poll() is None:
+                return  # окно настроек уже открыто — держим один экземпляр
+            try:
+                state["settings"] = subprocess.Popen([sys.executable, SCRIPT, "--settings"])
+            except Exception as e:
+                notify(icon, "Не удалось открыть настройки: %s" % e)
+
     def act_settings(icon, item):
-        subprocess.Popen([sys.executable, SCRIPT, "--settings"])
+        open_settings(icon)
+
+    def act_double(icon, item):
+        now = time.monotonic()
+        if now - last_click["t"] <= 0.5:
+            last_click["t"] = 0.0
+            open_settings(icon)
+        else:
+            last_click["t"] = now
 
     def act_autostart(icon, item):
         try:
@@ -758,6 +886,12 @@ def tray_main():
         notify(icon, status_text() + "\n\nДоставка: " + PROXY_STATE.get("detail", "—"))
 
     def act_quit(icon, item):
+        p = state.get("settings")
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
         icon.visible = False
         icon.stop()
 
@@ -772,6 +906,7 @@ def tray_main():
                  checked=lambda i: autostart_enabled()),
         MenuItem("Состояние", act_status),
         MenuItem("Выход", act_quit),
+        MenuItem("dblclick-open-settings", act_double, default=True, visible=False),
     )
     icon = pystray.Icon("claude-telemetry", make_image(state["value"]), "Claude Telemetry", menu)
 

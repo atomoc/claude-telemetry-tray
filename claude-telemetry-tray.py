@@ -39,7 +39,7 @@ from datetime import datetime
 SCRIPT = os.path.abspath(__file__)
 SYS = platform.system()
 REFRESH_INTERVAL = 5
-__version__ = "2.6"
+__version__ = "2.7"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
     "proxyPort": 4318,
 }
 
-PROXY_STATE = {"ok": None, "detail": "трафика ещё не было", "bound": False}
+PROXY_STATE = {"ok": None, "last": None, "detail": "трафика ещё не было", "bound": False}
 
 
 # ── Пути ─────────────────────────────────────────────────────────────────────
@@ -346,8 +346,11 @@ def _make_handler():
             # Фильтр по аккаунту
             acct = (cfg.get("account") or "").strip()
             if acct and not account_matches(acct, body, attrs):
+                seen = [a + "=" + attrs[a] for a in ACCOUNT_ATTR_KEYS if a in attrs]
+                PROXY_STATE.update(ok=None, last="skipped",
+                                   detail="отфильтровано (аккаунт не в списке): "
+                                          + (", ".join(seen) or "аккаунт не найден"))
                 if cfg.get("logTelemetry", True):
-                    seen = [a + "=" + attrs[a] for a in ACCOUNT_ATTR_KEYS if a in attrs]
                     log_line("ПРОПУЩЕНО %s: аккаунт != '%s' (в телеметрии: %s)"
                              % (self.path, acct, ", ".join(seen) or "не найден"))
                 self._reply(200)  # говорим Claude "ок", но НЕ пересылаем
@@ -373,7 +376,7 @@ def _make_handler():
                 with urllib.request.urlopen(req, timeout=15) as r:
                     code = getattr(r, "status", None) or r.getcode()
                     resp = r.read()
-                PROXY_STATE.update(ok=True, detail="сервер ответил HTTP %s" % code)
+                PROXY_STATE.update(ok=True, last="ok", detail="сервер ответил HTTP %s" % code)
             except urllib.error.HTTPError as e:
                 code = e.code
                 try:
@@ -381,14 +384,14 @@ def _make_handler():
                 except Exception:
                     resp = b""
                 if code in (401, 403):
-                    PROXY_STATE.update(ok=False, detail="HTTP %s — неверный токен" % code)
+                    PROXY_STATE.update(ok=False, last="error", detail="HTTP %s — неверный токен" % code)
                 elif code == 404:
-                    PROXY_STATE.update(ok=False, detail="HTTP 404 — неверный адрес")
+                    PROXY_STATE.update(ok=False, last="error", detail="HTTP 404 — неверный адрес")
                 else:
-                    PROXY_STATE.update(ok=True, detail="сервер ответил HTTP %s" % code)
+                    PROXY_STATE.update(ok=True, last="ok", detail="сервер ответил HTTP %s" % code)
             except Exception as e:
                 code, resp = 502, b""
-                PROXY_STATE.update(ok=False, detail="нет связи с сервером (%s)" % e.__class__.__name__)
+                PROXY_STATE.update(ok=False, last="error", detail="нет связи с сервером (%s)" % e.__class__.__name__)
                 if cfg.get("logTelemetry", True):
                     log_line("ОШИБКА пересылки → %s: %s" % (upstream, e))
             self._reply(code, resp)
@@ -781,6 +784,7 @@ COLORS = {
     "on": (46, 160, 67, 255),
     "off": (120, 120, 120, 255),
     "error": (210, 55, 55, 255),
+    "skipped": (40, 110, 220, 255),  # синий — последняя телеметрия отфильтрована
 }
 
 
@@ -795,8 +799,11 @@ def make_image(state):
 def compute_state():
     if not is_on():
         return "off"
-    if PROXY_STATE.get("ok") is False:
+    last = PROXY_STATE.get("last")
+    if last == "error":
         return "error"
+    if last == "skipped":
+        return "skipped"
     return "on"
 
 
@@ -816,11 +823,13 @@ def tray_main():
         "on": "Claude Telemetry: ВКЛ, доставка идёт",
         "off": "Claude Telemetry: выключено",
         "error": "Claude Telemetry: ошибка доставки!",
+        "skipped": "Claude Telemetry: телеметрия отфильтрована (аккаунт не в списке)",
     }
     labels = {
         "on": "● Телеметрия ВКЛ — доставка идёт",
         "off": "○ Телеметрия выкл",
         "error": "⚠ Доставка НЕ работает",
+        "skipped": "◆ Отфильтровано: аккаунт не в списке",
     }
 
     def notify(icon, msg):

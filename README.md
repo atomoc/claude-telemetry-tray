@@ -39,9 +39,9 @@ This project is the opposite: a **single-file desktop utility** for people who j
 - 👤 **Account filter** — reads `user.email` / `user.account_uuid` / `user.id` /
   `organization.id` from the OTLP payload and forwards **only** the configured account's
   telemetry. Switch Claude accounts and telemetry stops automatically.
-- 🔴🟢 **Live status icon** — green = delivering, grey = off, red = server rejected the
-  traffic (bad token / wrong URL / no connection). Derived from **real** responses, no
-  synthetic probe requests.
+- 🔵🔴🟢 **Live status icon** — green = delivering, grey = off, red = server rejected the
+  traffic (bad token / wrong URL / no connection), **blue = last telemetry was filtered out**
+  (account/domain not in the allowlist). Derived from **real** responses, no synthetic probes.
 - 🚀 **One-click install** — self-extracting installers per OS, with login auto-start.
 - 🔒 Writes Claude Code **managed settings** (system-wide, admin-elevated) so the config
   can't be overridden by individual users.
@@ -143,12 +143,10 @@ The **Account** field forwards only telemetry belonging to the accounts/domains 
 - a domain — `gmail.com` or `@gmail.com` (matches every `*@gmail.com`)
 - an account id — a `user.id` / `user.account_uuid` / `organization.id` value
 
-The matcher reads `user.email` and the id attributes from the OTLP payload. To find exact
-values, leave the field empty first, let Claude Code send some telemetry, then open the log —
-each forwarded entry is annotated with the detected `user.email`, `user.account_uuid`, etc.
-
-When a non-matching account's telemetry arrives, the proxy replies `200 OK` to Claude Code
-(so it doesn't retry) but **does not forward** it, and writes a skip line to the log.
+The matcher reads `user.email` and the id attributes from the OTLP payload. When a
+non-matching account's telemetry arrives, the proxy replies `200 OK` to Claude Code (so it
+doesn't retry) but **does not forward** it, writes a skip line to the log, and the tray icon
+turns **blue** with a "filtered out" tooltip.
 
 > Note: telemetry is enabled through Claude Code **managed settings** (system-wide, requires
 > admin once) — per-user settings do not enable Claude Code telemetry, so this is the only mode.

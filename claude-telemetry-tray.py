@@ -39,7 +39,7 @@ from datetime import datetime
 SCRIPT = os.path.abspath(__file__)
 SYS = platform.system()
 REFRESH_INTERVAL = 5
-__version__ = "2.5"
+__version__ = "2.6"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -60,7 +60,6 @@ DEFAULT_CONFIG = {
     "logUserPrompts": True,
     "logTelemetry": True,   # писать тело отправляемой телеметрии в лог-файл
     "proxyPort": 4318,
-    "scope": "user",   # "user" = ~/.claude/settings.json (без админа); "system" = managed (нужен админ)
 }
 
 PROXY_STATE = {"ok": None, "detail": "трафика ещё не было", "bound": False}
@@ -152,7 +151,7 @@ def build_env(cfg):
 
 
 def do_enable(cfg):
-    f = managed_file() if cfg.get("scope") == "system" else user_file()
+    f = managed_file()
     os.makedirs(os.path.dirname(f), exist_ok=True)
     settings = read_json(f) or {}
     env = settings.get("env") or {}
@@ -226,8 +225,7 @@ def status_text():
     cfg = load_config()
     acct = (cfg.get("account") or "").strip()
     lines.append("")
-    lines.append("  Режим: " + ("на всю систему (managed)" if cfg.get("scope") == "system" else "только мой пользователь"))
-    lines.append("  Фильтр аккаунта: " + (acct if acct else "выкл (отправляется всё)"))
+    lines.append("  Фильтр аккаунтов: " + (acct if acct else "выкл (отправляется всё)"))
     return "\n".join(lines)
 
 
@@ -282,21 +280,45 @@ def otlp_attrs(body_bytes):
     return out
 
 
+def _account_entries(account):
+    """Разбивает поле аккаунта в список (запятая/точка-с-запятой/пробел)."""
+    raw = (account or "").replace(",", " ").replace(";", " ")
+    return [p.strip().lower() for p in raw.split() if p.strip()]
+
+
 def account_matches(account, body_bytes, attrs):
-    """True если телеметрия относится к указанному аккаунту."""
-    acct = (account or "").strip().lower()
-    if not acct:
-        return True  # фильтр выключен — пропускаем всё
-    for k in ACCOUNT_ATTR_KEYS:
-        if k in attrs and acct == attrs[k].strip().lower():
-            return True
-    # запасной вариант — подстрока в значениях атрибутов или в теле
-    if any(acct in v.lower() for v in attrs.values()):
+    """True, если телеметрия относится к одному из указанных значений.
+    В поле можно перечислить через запятую/пробел:
+      * точный email     — test@gmail.com
+      * домен            — gmail.com  или  @gmail.com  (совпадут все *@gmail.com)
+      * произвольный ID  — значение user.id / user.account_uuid / organization.id
+    Пусто = фильтр выключен (отправляется всё)."""
+    entries = _account_entries(account)
+    if not entries:
         return True
-    try:
-        return acct in body_bytes.decode("utf-8", "replace").lower()
-    except Exception:
-        return False
+
+    email = (attrs.get("user.email") or "").strip().lower()
+    domain = email.split("@", 1)[1] if "@" in email else ""
+    ids = [attrs.get(k, "").strip().lower() for k in ACCOUNT_ATTR_KEYS]
+    ids = [v for v in ids if v]
+
+    for e in entries:
+        if "@" in e and not e.startswith("@"):
+            # точный email
+            if email and e == email:
+                return True
+        elif e.startswith("@") or "." in e:
+            # домен: gmail.com или @gmail.com
+            d = e[1:] if e.startswith("@") else e
+            if domain and domain == d:
+                return True
+            if e in ids:  # вдруг это ID с точкой
+                return True
+        else:
+            # произвольный идентификатор
+            if e in ids:
+                return True
+    return False
 
 
 # ── Локальный прокси-логгер ──────────────────────────────────────────────────
@@ -424,9 +446,6 @@ def run_elevated(extra_args):
 
 
 def elevate_enable(cfg):
-    if cfg.get("scope") != "system":   # user-scope: без прав админа
-        do_enable(cfg)
-        return True
     if is_admin():
         do_enable(cfg)
         return True
@@ -611,7 +630,7 @@ def run_settings_window():
     base_var = tk.StringVar(value=cfg.get("base", ""))
     ttk.Entry(frm, textvariable=base_var, width=60).pack(fill="x", pady=(0, 8))
 
-    ttk.Label(frm, text="Аккаунт Claude для отправки (email/ID; пусто = слать всё):").pack(anchor="w")
+    ttk.Label(frm, text="Аккаунты/домены (email, gmail.com, @gmail.com; через запятую; пусто = всё):").pack(anchor="w")
     acct_var = tk.StringVar(value=cfg.get("account", ""))
     ttk.Entry(frm, textvariable=acct_var, width=60).pack(fill="x", pady=(0, 8))
 
@@ -630,11 +649,7 @@ def run_settings_window():
 
     logtel_var = tk.BooleanVar(value=bool(cfg.get("logTelemetry", True)))
     ttk.Checkbutton(frm, text="Логировать отправляемую телеметрию в файл",
-                    variable=logtel_var).pack(anchor="w", pady=(0, 4))
-
-    scope_var = tk.BooleanVar(value=(cfg.get("scope") == "system"))
-    ttk.Checkbutton(frm, text="Применять на всю систему (нужен админ; пользователь не отключит)",
-                    variable=scope_var).pack(anchor="w", pady=(0, 14))
+                    variable=logtel_var).pack(anchor="w", pady=(0, 14))
 
     def save():
         port = port_var.get().strip()
@@ -649,7 +664,6 @@ def run_settings_window():
             "logUserPrompts": bool(prompts_var.get()),
             "logTelemetry": bool(logtel_var.get()),
             "proxyPort": int(port),
-            "scope": "system" if scope_var.get() else "user",
         }
         if not new["token"]:
             messagebox.showwarning("Внимание", "Токен не указан.")
@@ -657,20 +671,22 @@ def run_settings_window():
         if not new["base"]:
             messagebox.showwarning("Внимание", "Базовый URL не указан.")
             return
+        managed_keys = ("token", "teamId", "proxyPort", "logUserPrompts")
+        need_reapply = is_on() and any(
+            str(cfg.get(k, "")) != str(new.get(k, "")) for k in managed_keys)
         save_config(new)
-        if is_on():
+        if need_reapply:
             ok = elevate_enable(new)
             if ok:
                 messagebox.showinfo("Сохранено",
                                     "Настройки сохранены и применены.\n"
-                                    "Перезапусти трей, терминалы и IDE.")
+                                    "Перезапусти терминалы и IDE.")
             else:
                 messagebox.showwarning("Сохранено",
                                        "Настройки сохранены, но применить не удалось "
                                        "(права отклонены?).\nНажми «Включить» в трее вручную.")
         else:
-            messagebox.showinfo("Сохранено",
-                                "Настройки сохранены.\nНажми «Включить» в трее, чтобы применить.")
+            messagebox.showinfo("Сохранено", "Настройки сохранены.")
         root.destroy()
 
     def do_import():
@@ -702,8 +718,6 @@ def run_settings_window():
             prompts_var.set(bool(data.get("logUserPrompts")))
         if "logTelemetry" in data:
             logtel_var.set(bool(data.get("logTelemetry")))
-        if "scope" in data:
-            scope_var.set(data.get("scope") == "system")
         messagebox.showinfo("Импорт", "Настройки загружены из файла.\nПроверь значения и нажми «Сохранить».")
 
     def do_export():
@@ -722,7 +736,6 @@ def run_settings_window():
             "logUserPrompts": bool(prompts_var.get()),
             "logTelemetry": bool(logtel_var.get()),
             "proxyPort": int(port) if port.isdigit() else 4318,
-            "scope": "system" if scope_var.get() else "user",
         }
         try:
             with open(path, "w", encoding="utf-8") as f:

@@ -79,10 +79,10 @@ OTEL_RESOURCE_ATTRIBUTES=team.id=<teamId>
 
 - **Python 3.8+** (on Windows tick *"Add python.exe to PATH"* during install).
 - `pystray` and `Pillow` — installed automatically on first run.
-- A GUI toolkit for the settings window (**Tkinter**) and a tray backend. The installers
-  set these up automatically — on Debian/Ubuntu they `apt install` `python3-tk`,
-  `python3-gi`, `gir1.2-ayatanaappindicator3-0.1` and the GNOME AppIndicator extension and
-  enable it. On GNOME you may need to log out/in once so the shell shows the tray icon.
+- A GUI toolkit for the settings window (**Tkinter**) and a tray backend. The installers set
+  these up automatically — on Debian/Ubuntu they `apt install` `python3-tk`, `python3-gi`,
+  `gir1.2-ayatanaappindicator3-0.1` and the GNOME AppIndicator extension. On GNOME you may
+  need to log out/in once for the tray icon to appear.
 
 ## Install
 
@@ -115,8 +115,8 @@ Right-click (or click) the tray icon:
 
 | Menu item | What it does |
 |---|---|
-| **Enable / Disable** | Turns telemetry on/off. By default writes your **user** settings (no admin). Tick **Apply system-wide** in Settings for enforced managed settings (admin). |
-| **Settings…** | Token, collector URL, **account filter**, Team ID, proxy port, logging, and **Apply system-wide** scope |
+| **Enable / Disable** | Writes/clears Claude Code managed settings (asks for admin) |
+| **Settings…** | Token, collector URL, **account/domain filter**, Team ID, proxy port, logging, Import/Export |
 | **Start at login** | Toggle auto-start |
 | **Status** | Current state + last delivery result |
 | **Quit** | Exit |
@@ -134,16 +134,24 @@ python3 claude-telemetry-tray.py --enable-autostart   # add login auto-start
 python3 claude-telemetry-tray.py --log                # print log file path
 ```
 
-## Account filter
+## Account / domain filter
 
-Leave the **Account** field empty to forward everything. Set it to an email or account ID
-to forward only that account's telemetry. The easiest way to find the exact value: leave it
-empty first, let Claude Code send some telemetry, then open the log — each forwarded entry
-is annotated with the detected `user.email`, `user.account_uuid`, etc. Copy the value you
-want into the Account field.
+The **Account** field forwards only telemetry belonging to the accounts/domains you list
+(comma- or space-separated); leave it empty to forward everything. Each entry can be:
+
+- an exact email — `alice@corp.com`
+- a domain — `gmail.com` or `@gmail.com` (matches every `*@gmail.com`)
+- an account id — a `user.id` / `user.account_uuid` / `organization.id` value
+
+The matcher reads `user.email` and the id attributes from the OTLP payload. To find exact
+values, leave the field empty first, let Claude Code send some telemetry, then open the log —
+each forwarded entry is annotated with the detected `user.email`, `user.account_uuid`, etc.
 
 When a non-matching account's telemetry arrives, the proxy replies `200 OK` to Claude Code
-(so it doesn't retry) but **does not forward** it, and writes a `SKIPPED …` line to the log.
+(so it doesn't retry) but **does not forward** it, and writes a skip line to the log.
+
+> Note: telemetry is enabled through Claude Code **managed settings** (system-wide, requires
+> admin once) — per-user settings do not enable Claude Code telemetry, so this is the only mode.
 
 ## File locations
 

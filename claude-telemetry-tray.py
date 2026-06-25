@@ -34,12 +34,13 @@ import subprocess
 import urllib.request
 import urllib.error
 import http.server
+import traceback
 from datetime import datetime
 
 SCRIPT = os.path.abspath(__file__)
 SYS = platform.system()
 REFRESH_INTERVAL = 5
-__version__ = "2.7"
+__version__ = "3.13"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -60,6 +61,7 @@ DEFAULT_CONFIG = {
     "logUserPrompts": True,
     "logTelemetry": True,   # писать тело отправляемой телеметрии в лог-файл
     "proxyPort": 4318,
+    "autostartDefaulted": False,
 }
 
 PROXY_STATE = {"ok": None, "last": None, "detail": "трафика ещё не было", "bound": False}
@@ -322,6 +324,30 @@ def account_matches(account, body_bytes, attrs):
 
 
 # ── Локальный прокси-логгер ──────────────────────────────────────────────────
+_SSL_CTX = None
+_SSL_CTX_DONE = False
+
+
+def _get_ssl_context():
+    """SSL-контекст для пересылки на коллектор. На macOS системный Python часто
+    не имеет CA-бандла и не может проверить HTTPS-сертификаты — используем certifi,
+    иначе forward падает (значок краснеет, до коллектора ничего не доходит)."""
+    global _SSL_CTX, _SSL_CTX_DONE
+    if _SSL_CTX_DONE:
+        return _SSL_CTX
+    _SSL_CTX_DONE = True
+    try:
+        import ssl
+        try:
+            import certifi
+            _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            _SSL_CTX = ssl.create_default_context()
+    except Exception:
+        _SSL_CTX = None
+    return _SSL_CTX
+
+
 def _make_handler():
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -373,10 +399,20 @@ def _make_handler():
                 if self.headers.get(h):
                     req.add_header(h, self.headers[h])
             try:
-                with urllib.request.urlopen(req, timeout=15) as r:
+                ctx = (_get_ssl_context()
+                       if upstream.lower().startswith("https") else None)
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
                     code = getattr(r, "status", None) or r.getcode()
                     resp = r.read()
-                PROXY_STATE.update(ok=True, last="ok", detail="сервер ответил HTTP %s" % code)
+                if 200 <= int(code) < 300:
+                    PROXY_STATE.update(ok=True, last="ok",
+                                       detail="сервер принял HTTP %s" % code)
+                else:
+                    PROXY_STATE.update(ok=False, last="error",
+                                       detail="сервер ответил HTTP %s (не 2xx)" % code)
+                    if cfg.get("logTelemetry", True):
+                        log_line("ОТКАЗ сервера HTTP %s ← %s\n%s" % (
+                            code, upstream, (resp or b"")[:400].decode("utf-8", "replace")))
             except urllib.error.HTTPError as e:
                 code = e.code
                 try:
@@ -386,9 +422,17 @@ def _make_handler():
                 if code in (401, 403):
                     PROXY_STATE.update(ok=False, last="error", detail="HTTP %s — неверный токен" % code)
                 elif code == 404:
-                    PROXY_STATE.update(ok=False, last="error", detail="HTTP 404 — неверный адрес")
+                    PROXY_STATE.update(ok=False, last="error", detail="HTTP 404 — неверный адрес/путь")
+                elif code == 429:
+                    PROXY_STATE.update(ok=False, last="error",
+                                       detail="HTTP 429 — лимит запросов у коллектора (приёмник отбивает)")
                 else:
-                    PROXY_STATE.update(ok=True, last="ok", detail="сервер ответил HTTP %s" % code)
+                    # ЛЮБОЙ не-2xx — это отказ, а не успех (раньше ошибочно зеленело)
+                    PROXY_STATE.update(ok=False, last="error",
+                                       detail="сервер отверг HTTP %s" % code)
+                if cfg.get("logTelemetry", True):
+                    log_line("ОТКАЗ сервера HTTP %s ← %s\n%s" % (
+                        code, upstream, (resp or b"")[:400].decode("utf-8", "replace")))
             except Exception as e:
                 code, resp = 502, b""
                 PROXY_STATE.update(ok=False, last="error", detail="нет связи с сервером (%s)" % e.__class__.__name__)
@@ -448,10 +492,49 @@ def run_elevated(extra_args):
     return subprocess.run(["sudo", sys.executable, SCRIPT] + extra_args).returncode == 0
 
 
+def _mac_run_root_shell(shell_cmd):
+    """Выполняет shell-команду от root через osascript и возвращает успех.
+    Реальную ошибку (отказ, отмена пароля и т.п.) пишем в лог."""
+    osa = ('do shell script "%s" with administrator privileges'
+           % shell_cmd.replace("\\", "\\\\").replace('"', '\\"'))
+    r = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
+    if r.returncode != 0:
+        log_line("osascript (root) ошибка: " + ((r.stderr or "").strip() or "код %d" % r.returncode))
+    return r.returncode == 0
+
+
+def _mac_write_root(dest, content):
+    """Кладёт content в файл dest (system-wide) с правами root, без запуска
+    Python от root: пишем во временный файл и копируем его shell-командой."""
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+    tmp.write(content)
+    tmp.close()
+    d = os.path.dirname(dest)
+    cmd = "/bin/mkdir -p %s && /bin/cp %s %s && /bin/chmod 644 %s" % (
+        shlex.quote(d), shlex.quote(tmp.name), shlex.quote(dest), shlex.quote(dest))
+    try:
+        return _mac_run_root_shell(cmd)
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
+
 def elevate_enable(cfg):
     if is_admin():
         do_enable(cfg)
         return True
+    if SYS == "Darwin":
+        # Без запуска Python от root: собираем managed-settings.json в обычном
+        # процессе и копируем его на место одной shell-командой через osascript.
+        f = managed_file()
+        settings = read_json(f) or {}
+        env = settings.get("env") or {}
+        env.update(build_env(cfg))
+        settings["env"] = env
+        content = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+        return _mac_write_root(f, content)
     tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
     json.dump(cfg, tmp, ensure_ascii=False)
     tmp.close()
@@ -465,6 +548,21 @@ def elevate_disable():
     if is_admin():
         do_disable(managed_file(), user_file())
         return True
+    if SYS == "Darwin":
+        # Пользовательский файл чистим без прав (он наш), managed — через root.
+        disable_one(user_file())
+        f = managed_file()
+        settings = read_json(f) or {}
+        env = settings.get("env")
+        if isinstance(env, dict):
+            for k in TELEMETRY_KEYS:
+                env.pop(k, None)
+            if not env:
+                settings.pop("env", None)
+        if not settings:
+            return _mac_run_root_shell("/bin/rm -f %s" % shlex.quote(f))
+        content = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+        return _mac_write_root(f, content)
     return run_elevated(["--worker-disable", user_file()])
 
 
@@ -482,6 +580,73 @@ def _win_launch_cmd():
 def _mac_plist():
     return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
                         "io.github.claude-telemetry-tray.plist")
+
+
+def _mac_label():
+    return "io.github.claude-telemetry-tray"
+
+
+def _xml_escape(v):
+    return v.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _installed_script():
+    """Путь к копии скрипта в app-support (не под защитой TCC)."""
+    return os.path.join(os.path.dirname(config_path()), "claude-telemetry-tray.py")
+
+
+def _ensure_installed_script():
+    """Копирует скрипт в ~/Library/Application Support/claude-telemetry/.
+    Папки ~/Documents, ~/Desktop, ~/Downloads защищены TCC: агент launchd при
+    входе в систему получает 'Operation not permitted' и не может их прочитать.
+    Поэтому для автозапуска используем копию в app-support."""
+    dst = _installed_script()
+    try:
+        if os.path.abspath(SCRIPT) == os.path.abspath(dst):
+            return dst
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(SCRIPT, dst)
+        return dst
+    except Exception:
+        log_line("не удалось скопировать скрипт в app-support:\n"
+                 + traceback.format_exc())
+        return SCRIPT
+
+
+def _write_mac_plist(p):
+    """Пишет LaunchAgent с перенаправлением логов, рабочей директорией и PATH,
+    чтобы при входе в систему агент стартовал и любую ошибку можно было увидеть."""
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    logdir = os.path.dirname(config_path())
+    try:
+        os.makedirs(logdir, exist_ok=True)
+    except OSError:
+        pass
+    out = os.path.join(logdir, "launchd.out")
+    err = os.path.join(logdir, "launchd.err")
+    prog = _ensure_installed_script()   # копия в app-support (доступна launchd)
+    workdir = os.path.dirname(prog) or os.path.expanduser("~")
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0"><dict>\n'
+        '  <key>Label</key><string>%s</string>\n'
+        '  <key>ProgramArguments</key><array>'
+        '<string>%s</string><string>%s</string></array>\n'
+        '  <key>RunAtLoad</key><true/>\n'
+        '  <key>WorkingDirectory</key><string>%s</string>\n'
+        '  <key>StandardOutPath</key><string>%s</string>\n'
+        '  <key>StandardErrorPath</key><string>%s</string>\n'
+        '  <key>EnvironmentVariables</key><dict>'
+        '<key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string></dict>\n'
+        '</dict></plist>\n' % (
+            _mac_label(),
+            _xml_escape(sys.executable), _xml_escape(prog),
+            _xml_escape(workdir), _xml_escape(out), _xml_escape(err))
+    )
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(plist)
 
 
 def _linux_desktop():
@@ -521,24 +686,22 @@ def set_autostart(on):
         return
     if SYS == "Darwin":
         p = _mac_plist()
+        label = _mac_label()
+        try:
+            uid = os.getuid()
+        except AttributeError:
+            uid = None
         if on:
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            plist = (
-                '<?xml version="1.0" encoding="UTF-8"?>\n'
-                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-                '<plist version="1.0"><dict>\n'
-                '  <key>Label</key><string>io.github.claude-telemetry-tray</string>\n'
-                '  <key>ProgramArguments</key><array>'
-                '<string>%s</string><string>%s</string></array>\n'
-                '  <key>RunAtLoad</key><true/>\n'
-                '</dict></plist>\n' % (sys.executable, SCRIPT)
-            )
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(plist)
-            subprocess.run(["launchctl", "load", p])
+            # Просто кладём plist: при следующем входе launchd сам его запустит.
+            # Не делаем bootstrap/load сейчас, чтобы не поднять второй экземпляр
+            # поверх уже работающего (конфликт порта прокси, два значка).
+            _write_mac_plist(p)
         else:
-            subprocess.run(["launchctl", "unload", p])
+            if uid is not None:
+                subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (uid, label)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["launchctl", "unload", p],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 os.remove(p)
             except OSError:
@@ -565,7 +728,236 @@ def set_autostart(on):
 
 
 # ── Окно настроек (Tkinter) ──────────────────────────────────────────────────
+def _open_config_in_editor():
+    """Запасной путь: если нативное окно построить не удалось, открываем
+    config.json в текстовом редакторе по умолчанию."""
+    p = config_path()
+    try:
+        save_config(load_config())  # гарантируем, что файл есть и со всеми ключами
+    except Exception:
+        pass
+    try:
+        subprocess.run(["open", "-t", p])
+    except Exception:
+        try:
+            subprocess.run(["open", p])
+        except Exception:
+            sys.stderr.write("Открой конфиг вручную: %s\n" % p)
+    try:
+        subprocess.run([
+            "osascript", "-e",
+            'display notification "Отредактируй значения, сохрани (Cmd+S) и закрой '
+            'файл, затем нажми \u00abВключить\u00bb." with title "Claude Telemetry"'])
+    except Exception:
+        pass
+
+
+def run_settings_window_macos():
+    """Нативное окно настроек на AppKit (pyobjc). Используется на macOS, т.к.
+    системный Tk 8.5 из CommandLineTools рисует пустые окна. При любой ошибке
+    откатываемся к редактированию config.json в редакторе."""
+    try:
+        import AppKit
+        import objc  # noqa: F401
+        from Foundation import NSObject, NSMakeRect
+    except Exception:
+        _open_config_in_editor()
+        return
+
+    try:
+        cfg = load_config()
+        W, H, M = 520.0, 430.0, 20.0
+
+        app = AppKit.NSApplication.sharedApplication()
+        app.setActivationPolicy_(0)  # Regular — обычное окно с фокусом
+
+        style = (getattr(AppKit, "NSWindowStyleMaskTitled", 1)
+                 | getattr(AppKit, "NSWindowStyleMaskClosable", 2))
+        backing = getattr(AppKit, "NSBackingStoreBuffered", 2)
+        win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, W, H), style, backing, False)
+        win.setTitle_("Claude Telemetry — настройки")
+        win.center()
+        content = win.contentView()
+
+        def mklabel(text, y, size=12.0):
+            t = AppKit.NSTextField.alloc().initWithFrame_(
+                NSMakeRect(M, y, W - 2 * M, 17))
+            t.setStringValue_(text)
+            t.setBezeled_(False); t.setDrawsBackground_(False)
+            t.setEditable_(False); t.setSelectable_(False)
+            t.setFont_(AppKit.NSFont.systemFontOfSize_(size))
+            content.addSubview_(t)
+
+        def mkfield(value, y):
+            fld = AppKit.NSTextField.alloc().initWithFrame_(
+                NSMakeRect(M, y, W - 2 * M, 24))
+            fld.setStringValue_("" if value is None else str(value))
+            content.addSubview_(fld)
+            return fld
+
+        def mkcheck(text, on, y):
+            b = AppKit.NSButton.alloc().initWithFrame_(
+                NSMakeRect(M, y, W - 2 * M, 22))
+            b.setButtonType_(getattr(AppKit, "NSButtonTypeSwitch",
+                                     getattr(AppKit, "NSSwitchButton", 3)))
+            b.setTitle_(text)
+            b.setState_(1 if on else 0)
+            content.addSubview_(b)
+            return b
+
+        specs = [
+            ("token", "Токен (Authorization: Bearer):"),
+            ("base", "Базовый URL коллектора:"),
+            ("account", "Аккаунты/домены (email, gmail.com, @gmail.com; пусто = всё):"),
+            ("teamId", "Team ID:"),
+            ("proxyPort", "Порт прокси (1–65535):"),
+        ]
+        fields = {}
+        y = H - M - 17
+        for key, lab in specs:
+            mklabel(lab, y); y -= 26
+            fields[key] = mkfield(cfg.get(key, ""), y); y -= 22
+        y -= 6
+        prompts_btn = mkcheck("Логировать текст промптов (чувствительно к ПДн!)",
+                              bool(cfg.get("logUserPrompts", True)), y); y -= 28
+        logtel_btn = mkcheck("Логировать отправляемую телеметрию в файл",
+                             bool(cfg.get("logTelemetry", True)), y)
+
+        def _alert(msg):
+            a = AppKit.NSAlert.alloc().init()
+            a.setMessageText_("Внимание")
+            a.setInformativeText_(msg)
+            a.runModal()
+
+        class _SettingsDelegate(NSObject):
+            def save_(self, sender):
+                port = str(fields["proxyPort"].stringValue()).strip()
+                if not port.isdigit() or not (1 <= int(port) <= 65535):
+                    _alert("Порт прокси должен быть числом 1–65535."); return
+                token = str(fields["token"].stringValue()).strip()
+                base = str(fields["base"].stringValue()).strip().rstrip("/")
+                if not token:
+                    _alert("Токен не указан."); return
+                if not base:
+                    _alert("Базовый URL не указан."); return
+                save_config({
+                    "token": token,
+                    "base": base,
+                    "account": str(fields["account"].stringValue()).strip(),
+                    "teamId": str(fields["teamId"].stringValue()).strip(),
+                    "logUserPrompts": bool(prompts_btn.state()),
+                    "logTelemetry": bool(logtel_btn.state()),
+                    "proxyPort": int(port),
+                })
+                app.terminate_(None)
+
+            def cancel_(self, sender):
+                app.terminate_(None)
+
+            def windowWillClose_(self, note):
+                app.terminate_(None)
+
+            def import_(self, sender):
+                # NSOpenPanel в незабандленном агенте не получает клики мыши
+                # (панель живёт в отдельном XPC-процессе), поэтому показываем
+                # системный выбор файла через AppleScript — он кликается стабильно.
+                script = (
+                    'try\n'
+                    '  set f to choose file with prompt "Импорт настроек (JSON)"\n'
+                    '  return POSIX path of f\n'
+                    'on error\n'
+                    '  return ""\n'
+                    'end try'
+                )
+                r = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True)
+                path = (r.stdout or "").strip()
+                if not path:
+                    return
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    if not isinstance(data, dict):
+                        raise ValueError("ожидался JSON-объект")
+                except Exception as e:
+                    _alert("Не удалось прочитать файл:\n%s" % e)
+                    return
+                for k in ("token", "base", "account", "teamId", "proxyPort"):
+                    if k in data:
+                        fields[k].setStringValue_(str(data.get(k, "")))
+                if "logUserPrompts" in data:
+                    prompts_btn.setState_(1 if data.get("logUserPrompts") else 0)
+                if "logTelemetry" in data:
+                    logtel_btn.setState_(1 if data.get("logTelemetry") else 0)
+                _alert("Настройки загружены. Проверь значения и нажми «Сохранить».")
+
+            def export_(self, sender):
+                script = (
+                    'try\n'
+                    '  set f to choose file name with prompt "Экспорт настроек" '
+                    'default name "claude-telemetry-config.json"\n'
+                    '  return POSIX path of f\n'
+                    'on error\n'
+                    '  return ""\n'
+                    'end try'
+                )
+                r = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True)
+                path = (r.stdout or "").strip()
+                if not path:
+                    return
+                port = str(fields["proxyPort"].stringValue()).strip()
+                cur = {
+                    "token": str(fields["token"].stringValue()).strip(),
+                    "base": str(fields["base"].stringValue()).strip().rstrip("/"),
+                    "account": str(fields["account"].stringValue()).strip(),
+                    "teamId": str(fields["teamId"].stringValue()).strip(),
+                    "logUserPrompts": bool(prompts_btn.state()),
+                    "logTelemetry": bool(logtel_btn.state()),
+                    "proxyPort": int(port) if port.isdigit() else 4318,
+                }
+                try:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        json.dump(cur, fh, indent=2, ensure_ascii=False)
+                        fh.write("\n")
+                except Exception as e:
+                    _alert("Не удалось сохранить:\n%s" % e)
+                    return
+                _alert("Настройки сохранены в файл.")
+
+        delegate = _SettingsDelegate.alloc().init()
+        win.setDelegate_(delegate)
+
+        bw, bh = 100.0, 30.0
+
+        def mkbtn(title, x, action, default=False):
+            b = AppKit.NSButton.alloc().initWithFrame_(NSMakeRect(x, M, bw, bh))
+            b.setTitle_(title)
+            b.setBezelStyle_(getattr(AppKit, "NSBezelStyleRounded", 1))
+            if default:
+                b.setKeyEquivalent_("\r")
+            b.setTarget_(delegate); b.setAction_(action)
+            content.addSubview_(b)
+            return b
+
+        # слева — импорт/экспорт, справа — отмена/сохранить
+        mkbtn("Импорт…", M, "import:")
+        mkbtn("Экспорт…", M + bw + 8, "export:")
+        mkbtn("Отмена", W - M - 2 * bw - 8, "cancel:")
+        mkbtn("Сохранить", W - M - bw, "save:", default=True)
+
+        win.makeKeyAndOrderFront_(None)
+        app.activateIgnoringOtherApps_(True)
+        app.run()
+    except Exception:
+        log_line("нативное окно настроек не построилось:\n" + traceback.format_exc())
+        _open_config_in_editor()
+
+
 def run_settings_window():
+    if SYS == "Darwin":
+        return run_settings_window_macos()
     try:
         import tkinter as tk
         from tkinter import ttk, messagebox, filedialog
@@ -759,6 +1151,86 @@ def run_settings_window():
 
 
 # ── Трей ─────────────────────────────────────────────────────────────────────
+def _venv_dir():
+    return os.path.join(os.path.dirname(config_path()), "venv")
+
+
+def _venv_python(vdir):
+    if SYS == "Windows":
+        return os.path.join(vdir, "Scripts", "python.exe")
+    return os.path.join(vdir, "bin", "python3")
+
+
+def _deps_importable():
+    try:
+        import pystray  # noqa
+        from PIL import Image  # noqa
+        import certifi      # noqa  (нужен для проверки HTTPS-сертификатов коллектора)
+        if SYS == "Darwin":
+            import AppKit       # noqa
+            import Foundation   # noqa
+        return True
+    except Exception:
+        return False
+
+
+def ensure_runtime():
+    """Делает программу самодостаточной: если нужных модулей нет, создаёт
+    собственный venv, ставит туда зависимости ТОЛЬКО из готовых wheel
+    (без компиляции) и перезапускает себя внутри этого venv.
+
+    Это обходит типичные проблемы macOS:
+      • системный python 3.9 из CommandLineTools без рабочего компилятора;
+      • старый pip, не знающий --break-system-packages;
+      • PEP 668 / externally-managed environment;
+      • отсутствие cp39-колёс у новейшего pyobjc (venv + --only-binary
+        заставляют pip взять совместимую версию).
+    """
+    # Авто-bootstrap имеет смысл там, где зависимости ставятся как wheel.
+    # На Linux трею нужны системные пакеты (GTK/AppIndicator) — там полагаемся
+    # на штатный путь и инструкции в README.
+    if SYS not in ("Darwin", "Windows"):
+        return
+    if _deps_importable():
+        return
+
+    tries = int(os.environ.get("CT_BOOTSTRAP", "0") or "0")
+    if tries >= 2:
+        return  # больше не зацикливаемся — отдадим управление обычному пути
+
+    vdir = _venv_dir()
+    vpy = _venv_python(vdir)
+    try:
+        if not os.path.exists(vpy):
+            os.makedirs(os.path.dirname(vdir), exist_ok=True)
+            print("Готовлю окружение (это нужно один раз)…")
+            subprocess.run([sys.executable, "-m", "venv", vdir], check=True)
+        # pip посвежее лучше разбирает --only-binary; ошибки не критичны.
+        try:
+            subprocess.run([vpy, "-m", "pip", "install", "--upgrade", "pip"],
+                           check=False)
+        except Exception:
+            pass
+        pkgs = ["pystray", "Pillow", "certifi"]
+        extra = []
+        if SYS == "Darwin":
+            pkgs += ["pyobjc-framework-Cocoa", "pyobjc-framework-Quartz"]
+            extra = ["--only-binary=:all:"]
+        print("Устанавливаю зависимости…")
+        subprocess.run([vpy, "-m", "pip", "install"] + extra + pkgs, check=True)
+    except Exception:
+        log_line("bootstrap venv не удался:\n" + traceback.format_exc())
+        return  # пусть отработает ensure_tray_deps / сообщение об ошибке
+
+    # Перезапускаемся внутри venv, где все модули уже доступны.
+    env = dict(os.environ)
+    env["CT_BOOTSTRAP"] = str(tries + 1)
+    try:
+        os.execve(vpy, [vpy, SCRIPT] + sys.argv[1:], env)
+    except Exception:
+        log_line("re-exec в venv не удался:\n" + traceback.format_exc())
+
+
 def ensure_tray_deps():
     try:
         import pystray  # noqa
@@ -766,8 +1238,26 @@ def ensure_tray_deps():
         return True
     except Exception:
         pass
-    for args in (["--user", "pystray", "Pillow"],
-                 ["--user", "--break-system-packages", "pystray", "Pillow"]):
+    # На macOS бэкенду pystray нужен pyobjc (AppKit/Foundation/Quartz),
+    # иначе значок в menu bar не появляется.
+    pkgs = ["pystray", "Pillow", "certifi"]
+    extra = []
+    if SYS == "Darwin":
+        pkgs += ["pyobjc-framework-Cocoa", "pyobjc-framework-Quartz"]
+        # Только готовые wheel: системный python 3.9 (CommandLineTools) не может
+        # собрать pyobjc-core из исходников ("Cannot locate a working compiler").
+        # Флаг заставляет pip выбрать версию pyobjc с готовым wheel (11.1 для cp39)
+        # вместо новейшей 12.0, у которой колёс под 3.9 уже нет.
+        extra = ["--only-binary=:all:"]
+    # --break-system-packages понимает только новый pip (23+); старый pip 21.x
+    # падает на нём с "no such option", поэтому держим его отдельной последней
+    # попыткой и не прерываем цепочку при ошибке.
+    attempts = [
+        ["--user"] + extra + pkgs,
+        extra + pkgs,
+        ["--user", "--break-system-packages"] + extra + pkgs,
+    ]
+    for args in attempts:
         try:
             subprocess.run([sys.executable, "-m", "pip", "install"] + args, check=True)
             import importlib
@@ -785,6 +1275,7 @@ COLORS = {
     "off": (120, 120, 120, 255),
     "error": (210, 55, 55, 255),
     "skipped": (40, 110, 220, 255),  # синий — последняя телеметрия отфильтрована
+    "waiting": (230, 170, 40, 255),  # жёлтый — включено, но трафика ещё не было
 }
 
 
@@ -804,13 +1295,22 @@ def compute_state():
         return "error"
     if last == "skipped":
         return "skipped"
-    return "on"
+    if last == "ok":
+        return "on"          # был реальный успешный форвард (2xx)
+    return "waiting"         # включено, но ни одного форварда ещё не случилось
 
 
 def tray_main():
     if not ensure_tray_deps():
-        sys.stderr.write("Не удалось установить pystray/Pillow. "
-                         "Установи вручную: pip install pystray Pillow\n")
+        if SYS == "Darwin":
+            sys.stderr.write(
+                "Не удалось установить pystray/Pillow/pyobjc.\n"
+                "Установи вручную (только бинарные wheel, без компиляции):\n"
+                "  python3 -m pip install --user --only-binary=:all: "
+                "pystray Pillow pyobjc-framework-Cocoa pyobjc-framework-Quartz\n")
+        else:
+            sys.stderr.write("Не удалось установить pystray/Pillow. "
+                             "Установи вручную: pip install pystray Pillow\n")
         sys.exit(1)
     import time
     import traceback
@@ -819,17 +1319,33 @@ def tray_main():
 
     state = {"value": compute_state(), "settings": None}
     settings_lock = threading.Lock()
+
+    def run_on_main(fn):
+        """На macOS все вызовы AppKit (NSStatusItem) обязаны идти из главного
+        потока. setup и monitor у pystray работают в фоновых потоках, поэтому
+        прямые обращения к значку приводили к тому, что иконка не появлялась.
+        Перекидываем работу в главный цикл NSApplication."""
+        if SYS == "Darwin":
+            try:
+                from Foundation import NSOperationQueue
+                NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+                return
+            except Exception:
+                pass
+        fn()
     titles = {
         "on": "Claude Telemetry: ВКЛ, доставка идёт",
         "off": "Claude Telemetry: выключено",
         "error": "Claude Telemetry: ошибка доставки!",
         "skipped": "Claude Telemetry: телеметрия отфильтрована (аккаунт не в списке)",
+        "waiting": "Claude Telemetry: ВКЛ, но трафика ещё не было",
     }
     labels = {
         "on": "● Телеметрия ВКЛ — доставка идёт",
         "off": "○ Телеметрия выкл",
         "error": "⚠ Доставка НЕ работает",
         "skipped": "◆ Отфильтровано: аккаунт не в списке",
+        "waiting": "◐ ВКЛ — ждём первый трафик",
     }
 
     def notify(icon, msg):
@@ -841,12 +1357,16 @@ def tray_main():
     def update_now(icon):
         st = compute_state()
         state["value"] = st
-        try:
-            icon.icon = make_image(st)
-            icon.title = titles.get(st, "Claude Telemetry")
-            icon.update_menu()
-        except Exception:
-            pass
+
+        def apply():
+            try:
+                icon.icon = make_image(st)
+                icon.title = titles.get(st, "Claude Telemetry")
+                icon.update_menu()
+            except Exception:
+                pass
+
+        run_on_main(apply)
 
     def monitor(icon):
         while True:
@@ -932,9 +1452,37 @@ def tray_main():
     )
     icon = pystray.Icon("claude-telemetry", make_image(state["value"]), "Claude Telemetry", menu)
 
+    if SYS == "Darwin":
+        # Без явной политики активации процесс-скрипт может стартовать как
+        # «Prohibited» — тогда NSStatusItem не показывается. Accessory делает
+        # приложение агентом menu bar (и убирает иконку-«ракету» из Dock).
+        try:
+            import AppKit
+            AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+                AppKit.NSApplicationActivationPolicyAccessory)
+        except Exception:
+            log_line("не удалось задать activation policy:\n" + traceback.format_exc())
+
     def setup(icon):
-        icon.visible = True
+        # Показ значка тоже трогает AppKit — делаем это в главном потоке.
+        run_on_main(lambda: setattr(icon, "visible", True))
         start_proxy()
+        # По умолчанию включаем автозапуск при первом старте (однократно;
+        # дальше уважаем ручное вкл/выкл через меню).
+        try:
+            c = load_config()
+            if not c.get("autostartDefaulted"):
+                if not autostart_enabled():
+                    set_autostart(True)
+                c["autostartDefaulted"] = True
+                save_config(c)
+            # Если автозапуск включён — переписываем plist в актуальный формат
+            # (с логами/рабочей директорией), эффект — при следующем входе.
+            if SYS == "Darwin" and autostart_enabled():
+                _write_mac_plist(_mac_plist())
+        except Exception:
+            log_line("автозапуск по умолчанию не удалось включить:\n"
+                     + traceback.format_exc())
         threading.Thread(target=monitor, args=(icon,), daemon=True).start()
 
     log_line("трей запускается (%s)" % SYS)
@@ -996,6 +1544,7 @@ def main():
     if "--disable" in args:
         elevate_disable()
         return
+    ensure_runtime()
     tray_main()
 
 

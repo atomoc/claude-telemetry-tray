@@ -75,6 +75,46 @@ OTEL_RESOURCE_ATTRIBUTES=team.id=<teamId>
 > Because telemetry always goes through the local proxy, **the tray app must be running**
 > for telemetry to be delivered. The installers enable login auto-start for you.
 
+## Install on macOS (one file)
+
+Download **`claude-telemetry-macos.command`** from the latest [GitHub Release](https://github.com/atomoc/claude-telemetry-tray/releases) and run it (the first time: right-click → **Open**, because files from the internet are quarantined by Gatekeeper). That single file contains the whole app; on launch it:
+
+- unpacks the script into `~/Library/Application Support/claude-telemetry/`,
+- creates a private virtualenv and installs dependencies as prebuilt wheels,
+- starts the menu-bar icon and closes the Terminal window,
+- enables **start-at-login** automatically.
+
+Then open **Settings…** from the tray icon, enter your token and collector URL, **Save**, and **Enable** (asks for the admin password once). Restart Claude Code / your terminals so it picks up the managed settings.
+
+To update: download the newer `.command` from Releases and run it again.
+
+Maintainers regenerate this file with `python3 build-macos-command.py` (outputs `dist/claude-telemetry-macos.command`) and attach it to the Release.
+
+## macOS notes
+
+**Zero-setup launch.** Just double-click **`start-macos.command`** (or run `python3 claude-telemetry-tray.py`). On first run the app makes itself self-contained: it creates a private virtual environment under `~/Library/Application Support/claude-telemetry/venv`, installs its dependencies there **as prebuilt wheels** (no compiler needed), and re-launches itself inside that environment. Later runs start instantly.
+
+This deliberately avoids the common failure modes of the stock `/Library/Developer/CommandLineTools` Python 3.9: no working C compiler (so `pyobjc-core` can't build from source), an old `pip` that doesn't know `--break-system-packages`, PEP 668 "externally managed" environments, and the fact that the newest pyobjc no longer ships cp39 wheels (the venv + `--only-binary=:all:` make pip pick a compatible 11.x build automatically).
+
+On macOS the tray lives in the **menu bar**. The app now:
+
+- installs the required **pyobjc** frameworks (`pyobjc-framework-Cocoa`, `pyobjc-framework-Quartz`) automatically — pystray's macOS backend needs them or the icon never appears;
+- sets the process to **accessory** activation policy, so the menu-bar icon is allowed to show and no Python "rocket" appears in the Dock;
+- performs all status-item updates on the **main thread** (pystray runs the setup and refresh callbacks in background threads, and AppKit must be touched only from the main thread — otherwise the icon silently fails to render).
+
+The dependency install uses `--only-binary=:all:` on macOS so pip downloads ready-made **wheels** instead of compiling `pyobjc-core` (the stock `/Library/Developer/CommandLineTools` Python 3.9 has no working compiler, and pyobjc 12.0 no longer ships cp39 wheels — pip automatically falls back to 11.1).
+
+If you hit a build error like *"Cannot locate a working compiler"* on an older Python, install the deps manually:
+
+```bash
+python3 -m pip install --user --only-binary=:all: \
+  pystray Pillow pyobjc-framework-Cocoa pyobjc-framework-Quartz
+```
+
+**Settings window is native.** macOS' built-in Tk (8.5, shipped with the CommandLineTools Python) renders blank windows, so the Settings panel is drawn with native AppKit (pyobjc) instead. If that ever fails, the app falls back to opening `config.json` in your default editor.
+
+If the icon still doesn't show, check the log (`python3 claude-telemetry-tray.py --log`) and make sure no other menu-bar item is hiding it behind the notch.
+
 ## Requirements
 
 - **Python 3.8+** (on Windows tick *"Add python.exe to PATH"* during install).

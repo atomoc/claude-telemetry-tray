@@ -448,39 +448,42 @@ def _uuids_in_file(path):
 def _scan_sessions():
     """session_id → (account_uuid, organization_uuid).
 
-    Приложение раскладывает сессии по папкам аккаунта и организации, но в трёх
-    видах сразу, поэтому смотрим все:
-      claude-code-sessions/<acct>/<org>/<session_id>          — обычный чат
-      claude-code-sessions/<acct>/<org>/deleted_<session_id>  — удалённый чат
-      claude-code-sessions/<acct>/<org>/local_*.json          — файл-указатель,
-          id сессии лежит внутри (свежий чат появляется здесь с задержкой)
-      local-agent-mode-sessions/<acct>/<org>/*/.claude/projects/*/<sid>.jsonl
+    Приложение раскладывает сессии по папкам аккаунта и организации, но набор
+    самих папок различается между системами: на Windows это «claude-code-sessions»
+    и «local-agent-mode-sessions», на macOS второй есть, а первого нет. Поэтому
+    имена не перечисляем, а берём внутри каталога данных всё, что похоже на
+    хранилище сессий, и разбираем оба встречающихся вида раскладки:
+
+      <sessions>/<acct>/<org>/<session_id>            — обычный чат
+      <sessions>/<acct>/<org>/deleted_<session_id>    — удалённый чат
+      <sessions>/<acct>/<org>/local_*.json            — файл-указатель, id внутри
+      <sessions>/<acct>/<org>/*/.claude/projects/*/<session_id>.jsonl
     """
     out = {}
     for root in claude_data_roots():
-        base = os.path.join(root, "claude-code-sessions")
-        for acct in _listdir(base):
-            for org in _listdir(os.path.join(base, acct)):
-                odir = os.path.join(base, acct, org)
-                for name in _listdir(odir):
-                    if name.startswith("local_") and name.endswith(".json"):
-                        for sid in _uuids_in_file(os.path.join(odir, name)):
+        for store in _listdir(root):
+            if "session" not in store.lower():
+                continue
+            base = os.path.join(root, store)
+            for acct in _listdir(base):
+                if not _UUID_RE.fullmatch(acct):
+                    continue
+                for org in _listdir(os.path.join(base, acct)):
+                    odir = os.path.join(base, acct, org)
+                    for name in _listdir(odir):
+                        if name.startswith("local_") and name.endswith(".json"):
+                            for sid in _uuids_in_file(os.path.join(odir, name)):
+                                out[sid] = (acct, org)
+                            continue
+                        sid = name[8:] if name.startswith("deleted_") else name
+                        sid = os.path.splitext(sid)[0].lower()
+                        if _UUID_RE.fullmatch(sid):
                             out[sid] = (acct, org)
-                        continue
-                    sid = name[8:] if name.startswith("deleted_") else name
-                    sid = os.path.splitext(sid)[0].lower()
-                    if _UUID_RE.fullmatch(sid):
-                        out[sid] = (acct, org)
-        # сессии агентского режима (cowork, запланированные задачи)
-        agents = os.path.join(root, "local-agent-mode-sessions")
-        for acct in _listdir(agents):
-            for org in _listdir(os.path.join(agents, acct)):
-                pattern = os.path.join(agents, acct, org, "*", ".claude",
-                                       "projects", "*", "*.jsonl")
-                for path in glob.glob(pattern):
-                    sid = os.path.splitext(os.path.basename(path))[0].lower()
-                    if _UUID_RE.fullmatch(sid):
-                        out[sid] = (acct, org)
+                    for path in glob.glob(os.path.join(
+                            odir, "*", ".claude", "projects", "*", "*.jsonl")):
+                        sid = os.path.splitext(os.path.basename(path))[0].lower()
+                        if _UUID_RE.fullmatch(sid):
+                            out[sid] = (acct, org)
     return out
 
 
@@ -492,33 +495,34 @@ def _listdir(path):
 
 
 def session_owner(session_id):
-    """(account_uuid, organization_uuid) владельца сессии либо None."""
+    """(account_uuid, organization_uuid) владельца сессии либо None.
+
+    Только чтение готового индекса: обход диска стоит доли секунды и живёт
+    в фоновом потоке, иначе он тормозил бы пересылку телеметрии."""
     if not session_id:
         return None
-    if session_id in _SESS_CACHE["map"]:
-        return _SESS_CACHE["map"][session_id]
-    now = time.time()
-    if now - _SESS_CACHE["scanned"] >= _SESS_RESCAN_INTERVAL:
-        try:
-            _SESS_CACHE["map"] = _scan_sessions()
-        except Exception as e:
-            log_line("индекс сессий: сканирование не удалось — %s: %s"
-                     % (e.__class__.__name__, e))
-        _SESS_CACHE["scanned"] = now
-        # состав индекса пишем в лог только при изменении, чтобы не засорять
-        mark = (len(_SESS_CACHE["map"]), tuple(claude_data_roots()))
-        if mark != _SESS_CACHE["logged"]:
-            _SESS_CACHE["logged"] = mark
-            log_line("индекс сессий: %d шт., каталоги: %s"
-                     % (mark[0], ", ".join(mark[1]) or "не найдены"))
     return _SESS_CACHE["map"].get(session_id)
 
 
-# Подсессии (агенты, хуки) своих указателей на диске не получают, опознать их
-# напрямую невозможно. Но экспортёр каждого процесса Claude держит собственное
-# соединение с прокси, и внутри одного соединения аккаунт не меняется — значит
-# неопознанную сессию можно отнести к владельцу последней опознанной в нём.
-PROC_OWNER = {}                 # соединение → (account_uuid, organization_uuid)
+def _session_index_loop():
+    """Фоновое обновление индекса сессий.
+
+    Пауза растёт вместе со стоимостью обхода: на машине с сотнями сессий он
+    занимает около секунды, и молотить его каждые пять секунд незачем."""
+    while True:
+        started = time.monotonic()
+        try:
+            _SESS_CACHE["map"] = _scan_sessions()
+        except Exception as e:
+            log_line("индекс сессий: обход не удался — %s: %s"
+                     % (e.__class__.__name__, e))
+        took = time.monotonic() - started
+        mark = (len(_SESS_CACHE["map"]), tuple(claude_data_roots()))
+        if mark != _SESS_CACHE["logged"]:
+            _SESS_CACHE["logged"] = mark
+            log_line("индекс сессий: %d шт. за %.1f с, каталоги: %s"
+                     % (mark[0], took, ", ".join(mark[1]) or "не найдены"))
+        time.sleep(max(_SESS_RESCAN_INTERVAL, took * 10))
 
 
 def _sv(attr):
@@ -864,6 +868,7 @@ def start_proxy():
                 pass
             log_line("аккаунты из лога: " + ", ".join(
                 "%s→%s" % (k[:8], v) for k, v in sorted(emails.items())))
+    threading.Thread(target=_session_index_loop, daemon=True).start()
     port = int(cfg.get("proxyPort", 4318))
     try:
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _make_handler())

@@ -383,20 +383,42 @@ _SESS_CACHE = {"map": {}, "scanned": 0.0, "logged": None}
 _SESS_RESCAN_INTERVAL = 5       # сек; свежая сессия появляется на диске не сразу
 
 
+_ROOTS_CACHE = {"value": None, "at": 0.0}
+_SESSION_DIRS = ("claude-code-sessions", "local-agent-mode-sessions")
+
+
 def claude_data_roots():
-    """Каталоги данных приложения Claude (их может быть несколько)."""
-    roots = []
+    """Каталоги данных приложения Claude.
+
+    Имя каталога жёстко не задаём: на Windows их сразу два — «Claude» и
+    «Claude-msix2», на других системах оно тоже может отличаться. Поэтому
+    просматриваем стандартные места и берём те каталоги со словом claude,
+    внутри которых действительно лежат сессии."""
+    if (_ROOTS_CACHE["value"] is not None
+            and time.monotonic() - _ROOTS_CACHE["at"] < 300):
+        return _ROOTS_CACHE["value"]
+
+    home = os.path.expanduser("~")
     if SYS == "Windows":
-        for var, name in (("APPDATA", "Claude"), ("LOCALAPPDATA", "Claude-msix2")):
-            base = os.environ.get(var)
-            if base:
-                roots.append(os.path.join(base, name))
+        bases = [os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")]
     elif SYS == "Darwin":
-        roots.append(os.path.join(os.path.expanduser("~"), "Library",
-                                  "Application Support", "Claude"))
+        bases = [os.path.join(home, "Library", "Application Support")]
     else:
-        roots.append(os.path.join(os.path.expanduser("~"), ".config", "Claude"))
-    return [r for r in roots if os.path.isdir(r)]
+        bases = [os.path.join(home, ".config"),
+                 os.path.join(home, ".local", "share")]
+
+    roots = []
+    for base in bases:
+        if not base:
+            continue
+        for name in _listdir(base):
+            if "claude" not in name.lower():
+                continue
+            path = os.path.join(base, name)
+            if any(os.path.isdir(os.path.join(path, d)) for d in _SESSION_DIRS):
+                roots.append(path)
+    _ROOTS_CACHE.update(value=roots, at=time.monotonic())
+    return roots
 
 
 _UUID_RE = re.compile(

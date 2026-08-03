@@ -23,8 +23,11 @@ claude-telemetry-tray.py — управление телеметрией Claude 
 """
 
 import os
+import re
 import sys
+import glob
 import json
+import time
 import shlex
 import shutil
 import platform
@@ -39,8 +42,11 @@ from datetime import datetime
 
 SCRIPT = os.path.abspath(__file__)
 SYS = platform.system()
-REFRESH_INTERVAL = 5
-__version__ = "3.13"
+REFRESH_INTERVAL = 5          # раз в сколько секунд перепроверять состояние
+# Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
+# пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
+STATE_CHANGED = threading.Event()
+__version__ = "3.14"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -58,13 +64,74 @@ DEFAULT_CONFIG = {
     "base": "",
     "teamId": "",
     "account": "",          # фильтр: отправлять только этот аккаунт (пусто = слать всё)
+    "fixAccount": True,     # чинить чужую подпись аккаунта по владельцу сессии
+    "accountEmails": {},    # account_uuid → email, накапливается из самой телеметрии
+    "logsExportInterval": 1000,   # мс; как часто Claude отдаёт накопленные логи
     "logUserPrompts": True,
     "logTelemetry": True,   # писать тело отправляемой телеметрии в лог-файл
     "proxyPort": 4318,
     "autostartDefaulted": False,
 }
 
-PROXY_STATE = {"ok": None, "last": None, "detail": "трафика ещё не было", "bound": False}
+PROXY_STATE = {
+    "ok": None, "last": None, "detail": "трафика ещё не было", "bound": False,
+    "sent": 0, "filtered": 0, "errors": 0,
+    "last_ok": 0.0, "last_any": 0.0,
+    "seq": 0, "ok_seq": 0, "err_seq": 0,
+    "act": {"kind": None, "time": 0.0},   # последнее действие пользователя
+    "accounts": {},          # email → [доставлено, отфильтровано]
+}
+STALE_AFTER = 300            # сек без успешной доставки → «трафика нет»
+
+
+def note_traffic(kind, email=None, detail=None, activity=True):
+    """Учёт пакета: kind ∈ {ok, filtered, error}.
+
+    Фильтрация поднимает синий и держит его: успешная доставка следующего
+    фонового экспорта синий не сбрасывает — иначе значок мигал бы от пингов
+    коллектора и застать «сейчас что-то режется» было бы невозможно.
+    Ошибка доставки перебивает всё и красит в красный."""
+    st = PROXY_STATE
+    now = time.monotonic()
+    # Порядок событий считаем счётчиком, а не временем: на Windows таймер
+    # грубый, и ошибка сразу после успеха попадала с ним в один и тот же тик.
+    st["seq"] += 1
+    st["last_any"] = now
+
+    if kind == "error":
+        st.update(ok=False, last="error", errors=st["errors"] + 1,
+                  err_seq=st["seq"], detail=detail or st["detail"])
+        STATE_CHANGED.set()
+        return
+    if kind == "ok":
+        # успешная доставка снимает красный и держит «трафик есть» даже когда
+        # это фоновый пинг, но в счётчики и в цвет пинг не попадает
+        st.update(ok=True, last="ok", last_ok=now, ok_seq=st["seq"])
+        STATE_CHANGED.set()      # успешный пинг снимает красный — это видно сразу
+    if not activity:
+        return
+
+    if kind == "ok":
+        st["sent"] += 1
+    else:
+        st.update(filtered=st["filtered"] + 1, last="skipped")
+    st["act"] = {"kind": kind, "time": now}
+    if detail:
+        st["detail"] = detail
+    if email:
+        acc = st["accounts"].setdefault(email, [0, 0])
+        acc[0 if kind == "ok" else 1] += 1
+    STATE_CHANGED.set()
+
+
+def traffic_summary():
+    st = PROXY_STATE
+    parts = ["доставлено %d" % st["sent"]]
+    if st["filtered"]:
+        parts.append("отфильтровано %d" % st["filtered"])
+    if st["errors"]:
+        parts.append("ошибок %d" % st["errors"])
+    return ", ".join(parts)
 
 
 # ── Пути ─────────────────────────────────────────────────────────────────────
@@ -144,7 +211,10 @@ def build_env(cfg):
         "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": logs_ep,
         "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer " + cfg["token"],
         "OTEL_METRIC_EXPORT_INTERVAL": "60000",
-        "OTEL_LOGS_EXPORT_INTERVAL": "5000",
+        # Чем реже Claude отдаёт логи, тем позже трей узнаёт о сообщении и тем
+        # позже перекрашивается значок. При простое экспорт не происходит вовсе,
+        # так что частый интервал ничего не стоит.
+        "OTEL_LOGS_EXPORT_INTERVAL": str(int(cfg.get("logsExportInterval", 1000))),
         "OTEL_RESOURCE_ATTRIBUTES": "team.id=" + cfg["teamId"],
     }
     if cfg.get("logUserPrompts"):
@@ -228,7 +298,27 @@ def status_text():
     acct = (cfg.get("account") or "").strip()
     lines.append("")
     lines.append("  Фильтр аккаунтов: " + (acct if acct else "выкл (отправляется всё)"))
+
+    st = PROXY_STATE
+    lines.append("  Трафик с запуска: " + traffic_summary())
+    if st["ok_seq"]:
+        lines.append("  Последняя доставка: %s назад"
+                     % _ago(time.monotonic() - st["last_ok"]))
+    if st["accounts"]:
+        lines.append("")
+        lines.append("  По аккаунтам (доставлено / отфильтровано):")
+        for email, (ok, filt) in sorted(st["accounts"].items()):
+            lines.append("    %-28s %d / %d" % (email or "без подписи", ok, filt))
     return "\n".join(lines)
+
+
+def _ago(sec):
+    sec = int(sec)
+    if sec < 60:
+        return "%d с" % sec
+    if sec < 3600:
+        return "%d мин" % (sec // 60)
+    return "%d ч %d мин" % (sec // 3600, (sec % 3600) // 60)
 
 
 # ── Лог ──────────────────────────────────────────────────────────────────────
@@ -280,6 +370,253 @@ def otlp_attrs(body_bytes):
 
     walk(obj)
     return out
+
+
+# ── Настоящий владелец сессии ────────────────────────────────────────────────
+# Claude Code подписывает телеметрию аккаунтом из ~/.claude.json (oauthAccount),
+# а не аккаунтом окна, в котором реально работает пользователь. Если в приложении
+# подключено несколько аккаунтов, подпись оказывается чужой: чат ведётся в одном
+# аккаунте, а user.email/account_uuid/organization.id уезжают от другого.
+# Настоящего владельца видно по тому, в чьей папке приложение хранит сессию:
+#   <данные Claude>/claude-code-sessions/<account_uuid>/<organization_uuid>/<session_id>
+_SESS_CACHE = {"map": {}, "scanned": 0.0, "logged": None}
+_SESS_RESCAN_INTERVAL = 5       # сек; свежая сессия появляется на диске не сразу
+
+
+def claude_data_roots():
+    """Каталоги данных приложения Claude (их может быть несколько)."""
+    roots = []
+    if SYS == "Windows":
+        for var, name in (("APPDATA", "Claude"), ("LOCALAPPDATA", "Claude-msix2")):
+            base = os.environ.get(var)
+            if base:
+                roots.append(os.path.join(base, name))
+    elif SYS == "Darwin":
+        roots.append(os.path.join(os.path.expanduser("~"), "Library",
+                                  "Application Support", "Claude"))
+    else:
+        roots.append(os.path.join(os.path.expanduser("~"), ".config", "Claude"))
+    return [r for r in roots if os.path.isdir(r)]
+
+
+_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+_FILE_CACHE = {}     # путь → (mtime, размер, [session_id, …])
+
+
+def _uuids_in_file(path):
+    """id сессий внутри файла-указателя; результат кэшируется по mtime/размеру."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    key = (st.st_mtime, st.st_size)
+    hit = _FILE_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            ids = list({u.lower() for u in _UUID_RE.findall(f.read())})
+    except OSError:
+        ids = []
+    _FILE_CACHE[path] = (key, ids)
+    return ids
+
+
+def _scan_sessions():
+    """session_id → (account_uuid, organization_uuid).
+
+    Приложение раскладывает сессии по папкам аккаунта и организации, но в трёх
+    видах сразу, поэтому смотрим все:
+      claude-code-sessions/<acct>/<org>/<session_id>          — обычный чат
+      claude-code-sessions/<acct>/<org>/deleted_<session_id>  — удалённый чат
+      claude-code-sessions/<acct>/<org>/local_*.json          — файл-указатель,
+          id сессии лежит внутри (свежий чат появляется здесь с задержкой)
+      local-agent-mode-sessions/<acct>/<org>/*/.claude/projects/*/<sid>.jsonl
+    """
+    out = {}
+    for root in claude_data_roots():
+        base = os.path.join(root, "claude-code-sessions")
+        for acct in _listdir(base):
+            for org in _listdir(os.path.join(base, acct)):
+                odir = os.path.join(base, acct, org)
+                for name in _listdir(odir):
+                    if name.startswith("local_") and name.endswith(".json"):
+                        for sid in _uuids_in_file(os.path.join(odir, name)):
+                            out[sid] = (acct, org)
+                        continue
+                    sid = name[8:] if name.startswith("deleted_") else name
+                    sid = os.path.splitext(sid)[0].lower()
+                    if _UUID_RE.fullmatch(sid):
+                        out[sid] = (acct, org)
+        # сессии агентского режима (cowork, запланированные задачи)
+        agents = os.path.join(root, "local-agent-mode-sessions")
+        for acct in _listdir(agents):
+            for org in _listdir(os.path.join(agents, acct)):
+                pattern = os.path.join(agents, acct, org, "*", ".claude",
+                                       "projects", "*", "*.jsonl")
+                for path in glob.glob(pattern):
+                    sid = os.path.splitext(os.path.basename(path))[0].lower()
+                    if _UUID_RE.fullmatch(sid):
+                        out[sid] = (acct, org)
+    return out
+
+
+def _listdir(path):
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def session_owner(session_id):
+    """(account_uuid, organization_uuid) владельца сессии либо None."""
+    if not session_id:
+        return None
+    if session_id in _SESS_CACHE["map"]:
+        return _SESS_CACHE["map"][session_id]
+    now = time.time()
+    if now - _SESS_CACHE["scanned"] >= _SESS_RESCAN_INTERVAL:
+        try:
+            _SESS_CACHE["map"] = _scan_sessions()
+        except Exception as e:
+            log_line("индекс сессий: сканирование не удалось — %s: %s"
+                     % (e.__class__.__name__, e))
+        _SESS_CACHE["scanned"] = now
+        # состав индекса пишем в лог только при изменении, чтобы не засорять
+        mark = (len(_SESS_CACHE["map"]), tuple(claude_data_roots()))
+        if mark != _SESS_CACHE["logged"]:
+            _SESS_CACHE["logged"] = mark
+            log_line("индекс сессий: %d шт., каталоги: %s"
+                     % (mark[0], ", ".join(mark[1]) or "не найдены"))
+    return _SESS_CACHE["map"].get(session_id)
+
+
+# Подсессии (агенты, хуки) своих указателей на диске не получают, опознать их
+# напрямую невозможно. Но экспортёр каждого процесса Claude держит собственное
+# соединение с прокси, и внутри одного соединения аккаунт не меняется — значит
+# неопознанную сессию можно отнести к владельцу последней опознанной в нём.
+PROC_OWNER = {}                 # соединение → (account_uuid, organization_uuid)
+
+
+def _sv(attr):
+    """stringValue атрибута OTLP."""
+    return ((attr or {}).get("value") or {}).get("stringValue")
+
+
+def _fix_attr_list(lst, emails, changes, fallback=None, resolved=None):
+    """Правит подпись аккаунта в одном наборе атрибутов (запись или точка метрики)."""
+    am = {a.get("key"): a for a in lst if isinstance(a, dict) and a.get("key")}
+    if "session.id" not in am:
+        return
+    cur_acct, cur_mail = _sv(am.get("user.account_uuid")), _sv(am.get("user.email"))
+    # Пара «номер аккаунта ↔ почта» внутри пакета всегда согласованна (обе берутся
+    # из одного места), неверна лишь её привязка к сессии. Поэтому таблицу почт
+    # копим из любого пакета, даже из того, который сейчас будем править.
+    if cur_acct and cur_mail:
+        emails.setdefault(cur_acct, cur_mail)
+    sid = _sv(am["session.id"])
+    owner = session_owner(sid)
+    if owner:
+        if resolved is not None:
+            resolved.append(owner)
+    elif fallback:
+        owner = fallback
+        changes.append(("~", "сессия %s отнесена к процессу" % (sid or "")[:8]))
+    else:
+        changes.append(("?", "владелец сессии %s неизвестен" % (sid or "")[:8]))
+        return
+    acct, org = owner
+    if cur_acct == acct:
+        return
+
+    def put(key, val):
+        if key in am:
+            am[key]["value"] = {"stringValue": val}
+        else:
+            lst.append({"key": key, "value": {"stringValue": val}})
+
+    mail = emails.get(acct)
+    if not mail:
+        # Почта этого аккаунта неизвестна. Чинить номер аккаунта, оставив чужую
+        # почту, нельзя — получится противоречивая подпись, которая хуже исходной.
+        # Оставляем запись как есть и помечаем решение фильтра недостоверным.
+        changes.append(("?", "почта аккаунта %s неизвестна — подпись не тронута"
+                        % acct[:8]))
+        return
+
+    put("user.account_uuid", acct)
+    put("organization.id", org)
+    put("user.email", mail)
+    changes.append((cur_mail or cur_acct or "?", mail))
+
+
+def _walk_attr_lists(obj, fn):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "attributes" and isinstance(v, list):
+                fn(v)
+            else:
+                _walk_attr_lists(v, fn)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_attr_lists(item, fn)
+
+
+_PAIR_RE = re.compile(
+    r"user\.email=([^\s,\]]+).*?user\.account_uuid=([0-9a-f-]{36})", re.I)
+
+
+def seed_emails_from_log(emails):
+    """Достаёт пары «аккаунт → почта» из собственного лога.
+
+    Почта аккаунта берётся только из самой телеметрии, а Claude сейчас может
+    подписывать все пакеты одним аккаунтом — тогда почту второго узнать неоткуда.
+    Но в старых записях лога она, как правило, уже встречалась.
+    Возвращает число новых пар."""
+    added = 0
+    for path in (log_path(), log_path() + ".1"):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "user.email=" not in line:
+                        continue
+                    for mail, acct in _PAIR_RE.findall(line):
+                        if acct.lower() not in emails:
+                            emails[acct.lower()] = mail
+                            added += 1
+        except OSError:
+            continue
+    return added
+
+
+def fix_identity(body_bytes, emails, fallback=None):
+    """Меняет чужую подпись аккаунта на владельца сессии.
+    Возвращает (тело, список замен). Тело не меняется, если правит нечего."""
+    try:
+        obj = json.loads(body_bytes.decode("utf-8", "replace"))
+    except Exception:
+        return body_bytes, [], None
+    changes, resolved = [], []
+    _walk_attr_lists(obj, lambda lst: _fix_attr_list(
+        lst, emails, changes, fallback, resolved))
+    owner = resolved[-1] if resolved else None
+    if not [c for c in changes if c[0] not in ("?", "~")]:
+        return body_bytes, changes, owner
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8"), changes, owner
+
+
+def payload_has_activity(body_bytes):
+    """True, если в пакете есть действие пользователя, а не только фоновый
+    экспорт по таймеру. Claude шлёт метрики раз в минуту и логи раз в пять
+    секунд независимо от того, работает человек или нет; такие пинги не должны
+    ни перекрашивать значок, ни попадать в счётчики — иначе по ним невозможно
+    понять, что происходит с реальными сообщениями."""
+    try:
+        text = body_bytes.decode("utf-8", "replace")
+    except Exception:
+        return False
+    return '"user_prompt"' in text or '"prompt"' in text
 
 
 def _account_entries(account):
@@ -367,15 +704,52 @@ def _make_handler():
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
             cfg = load_config()
+
+            # Подпись аккаунта, которую ставит Claude, при нескольких подключённых
+            # аккаунтах бывает чужой. Чиним её по владельцу сессии — до фильтра,
+            # чтобы фильтр работал по настоящему аккаунту, и до отправки, чтобы
+            # на коллектор ушла верная разметка.
+            activity = payload_has_activity(body)
+            if cfg.get("fixAccount", True):
+                emails = dict(cfg.get("accountEmails") or {})
+                conn = self.client_address        # одно соединение = один процесс
+                body, changes, owner = fix_identity(
+                    body, emails, fallback=PROC_OWNER.get(conn))
+                if owner:
+                    PROC_OWNER[conn] = owner
+                if emails != (cfg.get("accountEmails") or {}):
+                    cfg["accountEmails"] = emails
+                    try:
+                        save_config(cfg)
+                    except Exception:
+                        pass
+                if cfg.get("logTelemetry", True):
+                    # номер соединения в логе позволяет отличить процессы Claude
+                    # друг от друга — иначе наследование аккаунта не проверить
+                    where = "%s [соединение %s]" % (self.path, conn[1])
+                    fixed = sorted({"%s → %s" % c for c in changes
+                                    if c[0] not in ("?", "~")})
+                    if fixed:
+                        log_line("ПОДПИСЬ ИСПРАВЛЕНА %s: %s" % (where, ", ".join(fixed)))
+                    inherited = sorted({c[1] for c in changes if c[0] == "~"})
+                    if inherited:
+                        log_line("ПОДПИСЬ ПО ПРОЦЕССУ %s: %s" % (where, ", ".join(inherited)))
+                    skipped = sorted({c[1] for c in changes if c[0] == "?"})
+                    if skipped:
+                        log_line("ПОДПИСЬ НЕ ПРОВЕРЕНА %s: %s" % (where, ", ".join(skipped)))
             attrs = otlp_attrs(body)
 
-            # Фильтр по аккаунту
+            # Фильтр по аккаунту. Если владельца сессии определить не удалось,
+            # пакет всё равно проходит фильтр — по той подписи, что в нём есть.
+            # Отправлять «на всякий случай» нельзя: телеметрия чужого аккаунта
+            # утечёт на коллектор, а это ровно то, ради чего фильтр и заведён.
             acct = (cfg.get("account") or "").strip()
             if acct and not account_matches(acct, body, attrs):
                 seen = [a + "=" + attrs[a] for a in ACCOUNT_ATTR_KEYS if a in attrs]
-                PROXY_STATE.update(ok=None, last="skipped",
-                                   detail="отфильтровано (аккаунт не в списке): "
-                                          + (", ".join(seen) or "аккаунт не найден"))
+                note_traffic("filtered", attrs.get("user.email"),
+                             detail="отфильтровано (аккаунт не в списке): "
+                                    + (", ".join(seen) or "аккаунт не найден"),
+                             activity=activity)
                 if cfg.get("logTelemetry", True):
                     log_line("ПРОПУЩЕНО %s: аккаунт != '%s' (в телеметрии: %s)"
                              % (self.path, acct, ", ".join(seen) or "не найден"))
@@ -405,11 +779,11 @@ def _make_handler():
                     code = getattr(r, "status", None) or r.getcode()
                     resp = r.read()
                 if 200 <= int(code) < 300:
-                    PROXY_STATE.update(ok=True, last="ok",
-                                       detail="сервер принял HTTP %s" % code)
+                    note_traffic("ok", attrs.get("user.email"),
+                                 detail="сервер принял HTTP %s" % code,
+                                 activity=activity)
                 else:
-                    PROXY_STATE.update(ok=False, last="error",
-                                       detail="сервер ответил HTTP %s (не 2xx)" % code)
+                    note_traffic("error", detail="сервер ответил HTTP %s (не 2xx)" % code)
                     if cfg.get("logTelemetry", True):
                         log_line("ОТКАЗ сервера HTTP %s ← %s\n%s" % (
                             code, upstream, (resp or b"")[:400].decode("utf-8", "replace")))
@@ -420,25 +794,33 @@ def _make_handler():
                 except Exception:
                     resp = b""
                 if code in (401, 403):
-                    PROXY_STATE.update(ok=False, last="error", detail="HTTP %s — неверный токен" % code)
+                    note_traffic("error", detail="HTTP %s — неверный токен" % code)
                 elif code == 404:
-                    PROXY_STATE.update(ok=False, last="error", detail="HTTP 404 — неверный адрес/путь")
+                    note_traffic("error", detail="HTTP 404 — неверный адрес/путь")
                 elif code == 429:
-                    PROXY_STATE.update(ok=False, last="error",
-                                       detail="HTTP 429 — лимит запросов у коллектора (приёмник отбивает)")
+                    note_traffic("error",
+                                 detail="HTTP 429 — лимит запросов у коллектора (приёмник отбивает)")
                 else:
                     # ЛЮБОЙ не-2xx — это отказ, а не успех (раньше ошибочно зеленело)
-                    PROXY_STATE.update(ok=False, last="error",
-                                       detail="сервер отверг HTTP %s" % code)
+                    note_traffic("error", detail="сервер отверг HTTP %s" % code)
                 if cfg.get("logTelemetry", True):
                     log_line("ОТКАЗ сервера HTTP %s ← %s\n%s" % (
                         code, upstream, (resp or b"")[:400].decode("utf-8", "replace")))
             except Exception as e:
                 code, resp = 502, b""
-                PROXY_STATE.update(ok=False, last="error", detail="нет связи с сервером (%s)" % e.__class__.__name__)
+                note_traffic("error",
+                             detail="нет связи с сервером (%s)" % e.__class__.__name__)
                 if cfg.get("logTelemetry", True):
                     log_line("ОШИБКА пересылки → %s: %s" % (upstream, e))
             self._reply(code, resp)
+
+        def finish(self):
+            # Номера портов операционная система переиспользует: если не забыть
+            # закрытое соединение, новый процесс может унаследовать чужой аккаунт.
+            try:
+                PROC_OWNER.pop(self.client_address, None)
+            finally:
+                http.server.BaseHTTPRequestHandler.finish(self)
 
         do_POST = _forward
 
@@ -450,6 +832,16 @@ def _make_handler():
 
 def start_proxy():
     cfg = load_config()
+    if cfg.get("fixAccount", True):
+        emails = dict(cfg.get("accountEmails") or {})
+        if seed_emails_from_log(emails):
+            cfg["accountEmails"] = emails
+            try:
+                save_config(cfg)
+            except Exception:
+                pass
+            log_line("аккаунты из лога: " + ", ".join(
+                "%s→%s" % (k[:8], v) for k, v in sorted(emails.items())))
     port = int(cfg.get("proxyPort", 4318))
     try:
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _make_handler())
@@ -841,7 +1233,10 @@ def run_settings_window_macos():
                     _alert("Токен не указан."); return
                 if not base:
                     _alert("Базовый URL не указан."); return
-                save_config({
+                # Дописываем в существующий конфиг, не подменяя его целиком —
+                # иначе теряются ключи, которых окно не знает (таблица почт).
+                merged = load_config()
+                merged.update({
                     "token": token,
                     "base": base,
                     "account": str(fields["account"].stringValue()).strip(),
@@ -850,6 +1245,7 @@ def run_settings_window_macos():
                     "logTelemetry": bool(logtel_btn.state()),
                     "proxyPort": int(port),
                 })
+                save_config(merged)
                 app.terminate_(None)
 
             def cancel_(self, sender):
@@ -1066,9 +1462,15 @@ def run_settings_window():
         if not new["base"]:
             messagebox.showwarning("Внимание", "Базовый URL не указан.")
             return
-        managed_keys = ("token", "teamId", "proxyPort", "logUserPrompts")
+        managed_keys = ("token", "teamId", "proxyPort", "logUserPrompts",
+                        "logsExportInterval")
         need_reapply = is_on() and any(
             str(cfg.get(k, "")) != str(new.get(k, "")) for k in managed_keys)
+        # Дописываем поля окна в существующий конфиг, а не подменяем его целиком:
+        # иначе стирается всё, чего окно не знает (таблица почт аккаунтов и пр.).
+        merged = load_config()
+        merged.update(new)
+        new = merged
         save_config(new)
         if need_reapply:
             ok = elevate_enable(new)
@@ -1274,8 +1676,9 @@ COLORS = {
     "on": (46, 160, 67, 255),
     "off": (120, 120, 120, 255),
     "error": (210, 55, 55, 255),
-    "skipped": (40, 110, 220, 255),  # синий — последняя телеметрия отфильтрована
-    "waiting": (230, 170, 40, 255),  # жёлтый — включено, но трафика ещё не было
+    "skipped": (40, 110, 220, 255),  # синий — телеметрия сейчас фильтруется
+    "waiting": (230, 170, 40, 255),  # жёлтый — включено, но трафика нет
+    "leaking": (150, 90, 200, 255),  # фиолетовый — выключено, а данные ещё идут
 }
 
 
@@ -1288,16 +1691,30 @@ def make_image(state):
 
 
 def compute_state():
+    """Цвет значка отвечает только на вопрос «доходит ли телеметрия».
+
+    Фильтрация цвет не меняет — это штатная работа, её видно в счётчиках.
+    У состояния есть срок годности: один давний успех больше не держит
+    значок зелёным вечно."""
+    now = time.monotonic()
+    st = PROXY_STATE
+    recent = lambda mark, seq: seq > 0 and now - mark < STALE_AFTER
+    act = st["act"]
+    broken = st["err_seq"] > st["ok_seq"]
+
     if not is_on():
-        return "off"
-    last = PROXY_STATE.get("last")
-    if last == "error":
-        return "error"
-    if last == "skipped":
-        return "skipped"
-    if last == "ok":
-        return "on"          # был реальный успешный форвард (2xx)
-    return "waiting"         # включено, но ни одного форварда ещё не случилось
+        # «Выключено» обязано означать «ничего не уходит». Но уже запущенные
+        # процессы Claude держат старое окружение и продолжают слать, пока их
+        # не перезапустят, — про это надо говорить прямо, а не показывать серый.
+        return "leaking" if recent(st["last_any"], st["seq"]) else "off"
+    if broken:
+        return "error"       # ошибка доставки важнее всего остального
+    if act["kind"] and now - act["time"] < STALE_AFTER:
+        # цвет задаёт последнее настоящее сообщение, а не фоновый экспорт
+        return "skipped" if act["kind"] == "filtered" else "on"
+    if recent(st["last_ok"], st["ok_seq"]):
+        return "on"          # сообщений давно не было, но доставка жива
+    return "waiting"
 
 
 def tray_main():
@@ -1337,15 +1754,18 @@ def tray_main():
         "on": "Claude Telemetry: ВКЛ, доставка идёт",
         "off": "Claude Telemetry: выключено",
         "error": "Claude Telemetry: ошибка доставки!",
-        "skipped": "Claude Telemetry: телеметрия отфильтрована (аккаунт не в списке)",
-        "waiting": "Claude Telemetry: ВКЛ, но трафика ещё не было",
+        "skipped": "Claude Telemetry: телеметрия фильтруется (аккаунт не в списке)",
+        "waiting": "Claude Telemetry: ВКЛ, но доставки давно не было",
+        "leaking": "Claude Telemetry: ВЫКЛЮЧЕНО, но данные ещё идут — "
+                   "перезапусти Claude",
     }
     labels = {
         "on": "● Телеметрия ВКЛ — доставка идёт",
         "off": "○ Телеметрия выкл",
         "error": "⚠ Доставка НЕ работает",
-        "skipped": "◆ Отфильтровано: аккаунт не в списке",
-        "waiting": "◐ ВКЛ — ждём первый трафик",
+        "skipped": "◆ Идёт фильтрация: аккаунт не в списке",
+        "waiting": "◐ ВКЛ — доставки давно не было",
+        "leaking": "◆ ВЫКЛ, но данные ещё идут — перезапусти Claude",
     }
 
     def notify(icon, msg):
@@ -1361,7 +1781,8 @@ def tray_main():
         def apply():
             try:
                 icon.icon = make_image(st)
-                icon.title = titles.get(st, "Claude Telemetry")
+                icon.title = "%s — %s" % (titles.get(st, "Claude Telemetry"),
+                                          traffic_summary())
                 icon.update_menu()
             except Exception:
                 pass
@@ -1371,7 +1792,10 @@ def tray_main():
     def monitor(icon):
         while True:
             update_now(icon)
-            time.sleep(REFRESH_INTERVAL)
+            # ждём либо события от прокси, либо таймера: событие даёт мгновенную
+            # реакцию на трафик, таймер — срабатывание выдержек и вкл/выкл
+            STATE_CHANGED.wait(REFRESH_INTERVAL)
+            STATE_CHANGED.clear()
 
     def act_enable(icon, item):
         cfg = load_config()

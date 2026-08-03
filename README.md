@@ -9,7 +9,10 @@ It runs a local proxy on `127.0.0.1`, points Claude Code's telemetry at it, then
 - **logs the real outgoing telemetry** to a local file (the exact payloads Claude Code sends),
 - **filters by Claude account** — only telemetry belonging to a chosen account is forwarded,
 - **forwards** the allowed telemetry to your own collector endpoint,
-- shows a **red / green / grey tray icon** reflecting real delivery status.
+- **fixes the account signature** when several accounts are signed in — Claude Code stamps
+  telemetry with the account from `~/.claude.json`, not with the account of the window you
+  actually work in,
+- shows a **tray icon** reflecting real delivery status.
 
 > One Python file. No Docker, no Collector, no cloud. Works on Windows, macOS and Linux.
 
@@ -39,9 +42,16 @@ This project is the opposite: a **single-file desktop utility** for people who j
 - 👤 **Account filter** — reads `user.email` / `user.account_uuid` / `user.id` /
   `organization.id` from the OTLP payload and forwards **only** the configured account's
   telemetry. Switch Claude accounts and telemetry stops automatically.
-- 🔵🔴🟢 **Live status icon** — green = delivering, grey = off, red = server rejected the
-  traffic (bad token / wrong URL / no connection), **blue = last telemetry was filtered out**
-  (account/domain not in the allowlist). Derived from **real** responses, no synthetic probes.
+- 🪪 **Correct account with several accounts signed in** — Claude Code takes the identity
+  from `~/.claude.json`, so with two accounts every packet carries the same wrong one and the
+  filter drops exactly what it should keep. The proxy resolves the real owner of the session
+  from the app's own on-disk layout and rewrites `user.email`, `user.account_uuid` and
+  `organization.id` before forwarding. Every substitution is written to the log.
+- 🔵🔴🟢 **Live status icon** — red = delivery is failing (bad token / wrong URL / no
+  connection), blue = telemetry is being filtered right now, green = delivering, yellow =
+  on, but nothing has arrived for five minutes, purple = switched off while running processes
+  still send, grey = off and silent. Background exports change neither the colour nor the
+  counters — only real messages do. Derived from **real** responses, no synthetic probes.
 - 🚀 **One-click install** — self-extracting installers per OS, with login auto-start.
 - 🔒 Writes Claude Code **managed settings** (system-wide, admin-elevated) so the config
   can't be overridden by individual users.
@@ -186,7 +196,10 @@ The **Account** field forwards only telemetry belonging to the accounts/domains 
 The matcher reads `user.email` and the id attributes from the OTLP payload. When a
 non-matching account's telemetry arrives, the proxy replies `200 OK` to Claude Code (so it
 doesn't retry) but **does not forward** it, writes a skip line to the log, and the tray icon
-turns **blue** with a "filtered out" tooltip.
+turns **blue** while filtering is going on. A successful background export does not clear
+the blue: otherwise the icon would flicker with every periodic ping and you could never catch
+the filter at work. A packet whose owner could not be established is judged by the signature it
+arrived with — it is never forwarded "just in case".
 
 > Note: telemetry is enabled through Claude Code **managed settings** (system-wide, requires
 > admin once) — per-user settings do not enable Claude Code telemetry, so this is the only mode.

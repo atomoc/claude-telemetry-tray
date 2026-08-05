@@ -46,7 +46,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.16"
+__version__ = "3.18"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -79,7 +79,7 @@ PROXY_STATE = {
     "last_ok": 0.0, "last_any": 0.0,
     "seq": 0, "ok_seq": 0, "err_seq": 0,
     "act": {"kind": None, "time": 0.0},   # последнее действие пользователя
-    "accounts": {},          # email → [доставлено, отфильтровано]
+    "accounts": {},          # email → {ok, filtered, last, at}
 }
 STALE_AFTER = 300            # сек без успешной доставки → «трафика нет»
 
@@ -119,9 +119,21 @@ def note_traffic(kind, email=None, detail=None, activity=True):
     if detail:
         st["detail"] = detail
     if email:
-        acc = st["accounts"].setdefault(email, [0, 0])
-        acc[0 if kind == "ok" else 1] += 1
+        acc = st["accounts"].setdefault(email, {"ok": 0, "filtered": 0,
+                                                "last": None, "at": 0.0})
+        acc[kind] += 1
+        acc["last"], acc["at"] = kind, now
     STATE_CHANGED.set()
+
+
+def accounts_title(state, accounts, titles):
+    """Подсказка к значку: расшифровка кружков в том же порядке, что и они."""
+    head = titles.get(state, "Claude Telemetry")
+    if not accounts or len(accounts) < 2 or state not in ("on", "skipped"):
+        return "%s — %s" % (head, traffic_summary())
+    marks = {"on": "доставляется", "skipped": "фильтруется", "idle": "молчит"}
+    return "Claude Telemetry: " + "; ".join(
+        "%s — %s" % (email, marks.get(st, st)) for email, st in accounts)
 
 
 def traffic_summary():
@@ -307,8 +319,12 @@ def status_text():
     if st["accounts"]:
         lines.append("")
         lines.append("  По аккаунтам (доставлено / отфильтровано):")
-        for email, (ok, filt) in sorted(st["accounts"].items()):
-            lines.append("    %-28s %d / %d" % (email or "без подписи", ok, filt))
+        for email, acc in sorted(st["accounts"].items()):
+            mark = {"ok": "доставляется", "filtered": "фильтруется"}.get(acc["last"], "")
+            if acc["at"] and time.monotonic() - acc["at"] >= STALE_AFTER:
+                mark = "молчит"
+            lines.append("    %-28s %d / %d   %s"
+                         % (email or "без подписи", acc["ok"], acc["filtered"], mark))
     return "\n".join(lines)
 
 
@@ -379,7 +395,7 @@ def otlp_attrs(body_bytes):
 # аккаунте, а user.email/account_uuid/organization.id уезжают от другого.
 # Настоящего владельца видно по тому, в чьей папке приложение хранит сессию:
 #   <данные Claude>/claude-code-sessions/<account_uuid>/<organization_uuid>/<session_id>
-_SESS_CACHE = {"map": {}, "scanned": 0.0, "logged": None}
+_SESS_CACHE = {"map": {}, "scanned": 0.0, "logged": None, "warned": 0.0}
 _SESS_RESCAN_INTERVAL = 5       # сек; свежая сессия появляется на диске не сразу
 
 
@@ -394,7 +410,11 @@ def claude_data_roots():
     «Claude-msix2», на других системах оно тоже может отличаться. Поэтому
     просматриваем стандартные места и берём те каталоги со словом claude,
     внутри которых действительно лежат сессии."""
-    if (_ROOTS_CACHE["value"] is not None
+    # Пустой результат не кэшируем: при старте вместе с системой каталоги
+    # приложения могут быть ещё не видны, и запомнить «ничего нет» на пять минут
+    # означает работать с пустым индексом — то есть молча ронять чужую сессию
+    # в фильтр, не проверив её владельца.
+    if (_ROOTS_CACHE["value"]
             and time.monotonic() - _ROOTS_CACHE["at"] < 300):
         return _ROOTS_CACHE["value"]
 
@@ -510,18 +530,28 @@ def _session_index_loop():
     Пауза растёт вместе со стоимостью обхода: на машине с сотнями сессий он
     занимает около секунды, и молотить его каждые пять секунд незачем."""
     while True:
-        started = time.monotonic()
+        took = 0.0
         try:
+            started = time.monotonic()
             _SESS_CACHE["map"] = _scan_sessions()
-        except Exception as e:
-            log_line("индекс сессий: обход не удался — %s: %s"
-                     % (e.__class__.__name__, e))
-        took = time.monotonic() - started
-        mark = (len(_SESS_CACHE["map"]), tuple(claude_data_roots()))
-        if mark != _SESS_CACHE["logged"]:
-            _SESS_CACHE["logged"] = mark
-            log_line("индекс сессий: %d шт. за %.1f с, каталоги: %s"
-                     % (mark[0], took, ", ".join(mark[1]) or "не найдены"))
+            took = time.monotonic() - started
+            mark = (len(_SESS_CACHE["map"]), tuple(claude_data_roots()))
+            if mark != _SESS_CACHE["logged"]:
+                _SESS_CACHE["logged"] = mark
+                log_line("индекс сессий: %d шт. за %.1f с, каталоги: %s"
+                         % (mark[0], took, ", ".join(mark[1]) or "не найдены"))
+            # Пустой индекс — это неработающая проверка аккаунта, а не тишина:
+            # напоминаем о нём, иначе трей часами фильтрует вслепую и молчит.
+            if not _SESS_CACHE["map"]:
+                now = time.monotonic()
+                if now - _SESS_CACHE["warned"] > 300:
+                    _SESS_CACHE["warned"] = now
+                    log_line("ВНИМАНИЕ: индекс сессий пуст — владелец сессии не "
+                             "проверяется, телеметрия судится по исходной подписи")
+        except Exception:
+            # поток обязан пережить любую ошибку: без него подпись не чинится
+            log_line("индекс сессий: сбой обхода:" + chr(10)
+                     + traceback.format_exc())
         time.sleep(max(_SESS_RESCAN_INTERVAL, took * 10))
 
 
@@ -1717,14 +1747,52 @@ COLORS = {
     "skipped": (40, 110, 220, 255),  # синий — телеметрия сейчас фильтруется
     "waiting": (230, 170, 40, 255),  # жёлтый — включено, но трафика нет
     "leaking": (150, 90, 200, 255),  # фиолетовый — выключено, а данные ещё идут
+    "idle": (140, 140, 140, 255),    # серый кружок — этот аккаунт молчит
 }
 
 
-def make_image(state):
+MAX_ACCOUNT_DOTS = 4        # больше кружков в значке 16×16 уже не различить
+
+
+def account_states():
+    """[(почта, состояние)] по каждому замеченному аккаунту.
+
+    Один значок на два аккаунта отвечает сразу на два вопроса и потому не
+    отвечает ни на один: пока шла работа одного аккаунта, зелёный цвет выглядел
+    как «доставлено» и для сообщений другого."""
+    now = time.monotonic()
+    out = []
+    for email, acc in PROXY_STATE["accounts"].items():
+        if now - acc["at"] < STALE_AFTER:
+            out.append((email, "on" if acc["last"] == "ok" else "skipped"))
+        else:
+            out.append((email, "idle"))
+    out.sort(key=lambda x: (x[1] == "idle", x[0]))   # активные впереди
+    return out[:MAX_ACCOUNT_DOTS]
+
+
+def _dot_boxes(n):
+    """Рамки кружков внутри значка 64×64."""
+    if n <= 1:
+        return [(6, 6, 58, 58)]
+    if n == 2:
+        return [(1, 17, 31, 47), (33, 17, 63, 47)]
+    if n == 3:
+        return [(1, 22, 21, 42), (22, 22, 42, 42), (43, 22, 63, 42)]
+    return [(1, 1, 31, 31), (33, 1, 63, 31), (1, 33, 31, 63), (33, 33, 63, 63)]
+
+
+def make_image(state, accounts=None):
     from PIL import Image, ImageDraw
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    d.ellipse((6, 6, 58, 58), fill=COLORS.get(state, COLORS["off"]))
+    # Делим значок на кружки только когда речь про сами аккаунты. Выключено,
+    # ошибка доставки, тишина — это про канал целиком, там кружок один.
+    if accounts and len(accounts) > 1 and state in ("on", "skipped"):
+        for box, (_, acc_state) in zip(_dot_boxes(len(accounts)), accounts):
+            d.ellipse(box, fill=COLORS.get(acc_state, COLORS["off"]))
+    else:
+        d.ellipse((6, 6, 58, 58), fill=COLORS.get(state, COLORS["off"]))
     return img
 
 
@@ -1818,9 +1886,9 @@ def tray_main():
 
         def apply():
             try:
-                icon.icon = make_image(st)
-                icon.title = "%s — %s" % (titles.get(st, "Claude Telemetry"),
-                                          traffic_summary())
+                accounts = account_states()
+                icon.icon = make_image(st, accounts)
+                icon.title = accounts_title(st, accounts, titles)
                 icon.update_menu()
             except Exception:
                 pass

@@ -46,7 +46,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.18"
+__version__ = "3.22"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -395,7 +395,7 @@ def otlp_attrs(body_bytes):
 # аккаунте, а user.email/account_uuid/organization.id уезжают от другого.
 # Настоящего владельца видно по тому, в чьей папке приложение хранит сессию:
 #   <данные Claude>/claude-code-sessions/<account_uuid>/<organization_uuid>/<session_id>
-_SESS_CACHE = {"map": {}, "scanned": 0.0, "logged": None, "warned": 0.0}
+_SESS_CACHE = {"map": {}, "orgs": {}, "scanned": 0.0, "logged": None, "warned": 0.0}
 _SESS_RESCAN_INTERVAL = 5       # сек; свежая сессия появляется на диске не сразу
 
 
@@ -490,6 +490,9 @@ def _scan_sessions():
                     continue
                 for org in _listdir(os.path.join(base, acct)):
                     odir = os.path.join(base, acct, org)
+                    # организация нужна, чтобы подставить подпись по процессу,
+                    # когда сессии в индексе нет
+                    _SESS_CACHE["orgs"].setdefault(acct, org)
                     for name in _listdir(odir):
                         if name.startswith("local_") and name.endswith(".json"):
                             for sid in _uuids_in_file(os.path.join(odir, name)):
@@ -534,6 +537,7 @@ def _session_index_loop():
         try:
             started = time.monotonic()
             _SESS_CACHE["map"] = _scan_sessions()
+            refresh_connection_owners(int(load_config().get("proxyPort", 4318)))
             took = time.monotonic() - started
             mark = (len(_SESS_CACHE["map"]), tuple(claude_data_roots()))
             if mark != _SESS_CACHE["logged"]:
@@ -553,6 +557,125 @@ def _session_index_loop():
             log_line("индекс сессий: сбой обхода:" + chr(10)
                      + traceback.format_exc())
         time.sleep(max(_SESS_RESCAN_INTERVAL, took * 10))
+
+
+# ── Аккаунт по процессу, а не по файлам сессий ───────────────────────────────
+# Указатели сессий на диске появляются и исчезают, поэтому опознать владельца
+# удаётся не всегда. Но у каждого профиля приложения свой каталог данных, и в
+# нём лежит config.json с полем lastKnownAccountUuid — то есть аккаунт можно
+# узнать по самому процессу, который прислал пакет: соединение → PID → каталог
+# профиля → аккаунт. Это не зависит от того, успел ли Claude записать сессию.
+CONN_ACCOUNTS = {}              # порт клиента → account_uuid
+_PROFILE_CACHE = {}             # config.json → (mtime, account_uuid)
+
+
+def _profile_account(exe_path):
+    """account_uuid профиля, из которого запущен процесс."""
+    d = os.path.dirname(exe_path or "")
+    for _ in range(6):                       # claude-code/<версия>/claude.exe → корень
+        cfg = os.path.join(d, "config.json")
+        try:
+            st = os.stat(cfg)
+        except OSError:
+            st = None
+        if st:
+            hit = _PROFILE_CACHE.get(cfg)
+            if not hit or hit[0] != st.st_mtime:
+                acct = None
+                try:
+                    with open(cfg, encoding="utf-8") as f:
+                        acct = (json.load(f) or {}).get("lastKnownAccountUuid")
+                except Exception:
+                    pass
+                _PROFILE_CACHE[cfg] = (st.st_mtime, acct)
+            acct = _PROFILE_CACHE[cfg][1]
+            if acct:
+                return acct
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+_CONN_REFRESH = {"at": 0.0}
+_CONN_REFRESH_INTERVAL = 30     # сек
+
+
+def refresh_connection_owners(port, force=False):
+    """Обновляет карту «соединение → аккаунт» по таблице TCP.
+
+    Делается в фоне одним вызовом на все соединения: разбирать процесс прямо
+    в обработчике запроса значило бы задерживать пересылку телеметрии."""
+    if SYS != "Windows":
+        return
+    now = time.monotonic()
+    if not force and now - _CONN_REFRESH["at"] < _CONN_REFRESH_INTERVAL:
+        return
+    _CONN_REFRESH["at"] = now
+    ps = ("Get-NetTCPConnection -RemotePort %d -ErrorAction SilentlyContinue | "
+          "ForEach-Object { $e=(Get-CimInstance Win32_Process -Filter "
+          "(\"ProcessId=\"+$_.OwningProcess)).ExecutablePath; "
+          "\"$($_.LocalPort) $e\" }" % port)
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=30,
+            # без этого флага каждый вызов из pythonw.exe рисует консольное окно:
+            # трей живёт без консоли, и PowerShell заводит её себе сам
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception:
+        return
+    fresh = {}
+    for line in (out or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        acct = _profile_account(parts[1])
+        if acct:
+            fresh[int(parts[0])] = acct
+    if fresh:
+        CONN_ACCOUNTS.clear()
+        CONN_ACCOUNTS.update(fresh)
+
+
+def _resolve_connection(port):
+    """Спрашивает процесс по одному соединению — когда фоновая карта не успела.
+
+    Короткоживущее соединение может возникнуть и закрыться между фоновыми
+    обходами; его пакеты тогда уходили по исходной подписи, а она при одном
+    залогиненном аккаунте у всех одинаковая. Пока запрос обрабатывается,
+    соединение заведомо живо, поэтому спросить о нём можно прямо здесь."""
+    if SYS != "Windows":
+        return None
+    ps = ("$c=Get-NetTCPConnection -LocalPort %d -ErrorAction SilentlyContinue | "
+          "Select-Object -First 1; if ($c) { (Get-CimInstance Win32_Process -Filter "
+          "(\"ProcessId=\"+$c.OwningProcess)).ExecutablePath }" % port)
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception:
+        return None
+    return _profile_account((out or "").strip())
+
+
+def connection_owner(client_address, resolve=False):
+    """(account_uuid, organization_uuid) по процессу, приславшему пакет."""
+    try:
+        port = client_address[1]
+    except Exception:
+        return None
+    acct = CONN_ACCOUNTS.get(port)
+    if not acct and resolve:
+        acct = _resolve_connection(port)
+        if acct:
+            CONN_ACCOUNTS[port] = acct
+    if not acct:
+        return None
+    org = _SESS_CACHE["orgs"].get(acct)
+    return (acct, org) if org else None
 
 
 # Подсессии (агенты, хуки) своих указателей на диске не получают, опознать их
@@ -669,21 +792,27 @@ def fix_identity(body_bytes, emails, fallback=None):
     return json.dumps(obj, ensure_ascii=False).encode("utf-8"), changes, owner
 
 
+# События, которые означают именно работу. Служебные — plugin_loaded,
+# mcp_server_connection — приходят при открытии окна и переподключении MCP,
+# то есть сами по себе, и раньше красили кружок аккаунта в «доставляется»
+# спустя часы после того, как в нём кто-то последний раз что-то делал.
+WORK_EVENTS = ("user_prompt", "api_request", "assistant_response",
+               "tool_decision", "tool_result", "hook_execution")
+
+
 def payload_has_activity(body_bytes):
     """True, если в пакете есть работа, а не периодический экспорт по таймеру.
 
     Метрики Claude шлёт раз в минуту независимо от того, происходит ли что-то;
     такой пинг не должен ни перекрашивать значок, ни попадать в счётчики.
-    Работу видно по событиям: промпт пользователя, запрос к модели, вызов
-    инструмента, хук, ответ. Считать работой только промпт оказалось мало —
-    длинная работа агента шла мимо счётчиков, хотя телеметрии от неё больше
-    всего. Признак простой: у пакетов с событиями есть event.name, у метрик его
-    нет ни в одном."""
+    Работой считаются события из WORK_EVENTS: промпт, запрос к модели, вызов
+    инструмента, хук, ответ. Не считаются метрики (у них событий нет вовсе) и
+    служебные события вроде подключения MCP-серверов."""
     try:
         text = body_bytes.decode("utf-8", "replace")
     except Exception:
         return False
-    return '"event.name"' in text
+    return any('"%s"' % e in text for e in WORK_EVENTS)
 
 
 def _account_entries(account):
@@ -780,8 +909,11 @@ def _make_handler():
             if cfg.get("fixAccount", True):
                 emails = dict(cfg.get("accountEmails") or {})
                 conn = self.client_address        # одно соединение = один процесс
-                body, changes, owner = fix_identity(
-                    body, emails, fallback=PROC_OWNER.get(conn))
+                # спрашиваем процесс, если соединение ещё не в фоновой карте:
+                # иначе пакет ушёл бы с чужой подписью, а вернуть его нельзя
+                fallback = (connection_owner(conn, resolve=True)
+                            or PROC_OWNER.get(conn))
+                body, changes, owner = fix_identity(body, emails, fallback=fallback)
                 if owner:
                     PROC_OWNER[conn] = owner
                 if emails != (cfg.get("accountEmails") or {}):

@@ -46,7 +46,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.22"
+__version__ = "3.24"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -80,11 +80,13 @@ PROXY_STATE = {
     "seq": 0, "ok_seq": 0, "err_seq": 0,
     "act": {"kind": None, "time": 0.0},   # последнее действие пользователя
     "accounts": {},          # email → {ok, filtered, last, at}
+    "blind_since": 0.0,      # с какого момента режем работу с неопознанным владельцем
+    "blind_warned": False,   # чтобы не спамить оповещением
 }
 STALE_AFTER = 300            # сек без успешной доставки → «трафика нет»
 
 
-def note_traffic(kind, email=None, detail=None, activity=True):
+def note_traffic(kind, email=None, detail=None, activity=True, blind=False):
     """Учёт пакета: kind ∈ {ok, filtered, error}.
 
     Фильтрация поднимает синий и держит его: успешная доставка следующего
@@ -115,6 +117,18 @@ def note_traffic(kind, email=None, detail=None, activity=True):
         st["sent"] += 1
     else:
         st.update(filtered=st["filtered"] + 1, last="skipped")
+        if blind:
+            # рабочий пакет отрезан, а владелец не определён — это ровно тот
+            # случай, когда своя же телеметрия молча теряется
+            if not st["blind_since"]:
+                st["blind_since"] = now
+        else:
+            st["blind_since"] = 0.0
+            st["blind_warned"] = False
+    if kind == "ok":
+        # доставка идёт — значит вслепую уже не режем
+        st["blind_since"] = 0.0
+        st["blind_warned"] = False
     st["act"] = {"kind": kind, "time": now}
     if detail:
         st["detail"] = detail
@@ -536,7 +550,13 @@ def _session_index_loop():
         took = 0.0
         try:
             started = time.monotonic()
-            _SESS_CACHE["map"] = _scan_sessions()
+            scanned = _scan_sessions()
+            # Пустой обход не затирает рабочий индекс: во время обновления
+            # приложения каталоги на секунды пропадают, а терять по этому поводу
+            # разбор сотен сессий (и снова слепо фильтровать) нельзя. Каталоги
+            # реально исчезли — увидим по warning ниже, но старую карту храним.
+            if scanned or not _SESS_CACHE["map"]:
+                _SESS_CACHE["map"] = scanned
             refresh_connection_owners(int(load_config().get("proxyPort", 4318)))
             took = time.monotonic() - started
             mark = (len(_SESS_CACHE["map"]), tuple(claude_data_roots()))
@@ -906,6 +926,7 @@ def _make_handler():
             # чтобы фильтр работал по настоящему аккаунту, и до отправки, чтобы
             # на коллектор ушла верная разметка.
             activity = payload_has_activity(body)
+            changes = []
             if cfg.get("fixAccount", True):
                 emails = dict(cfg.get("accountEmails") or {})
                 conn = self.client_address        # одно соединение = один процесс
@@ -945,10 +966,14 @@ def _make_handler():
             acct = (cfg.get("account") or "").strip()
             if acct and not account_matches(acct, body, attrs):
                 seen = [a + "=" + attrs[a] for a in ACCOUNT_ATTR_KEYS if a in attrs]
+                # «вслепую» — рабочий пакет режется, а владельца определить не
+                # удалось: подпись могла остаться чужой, и это теряет свою работу
+                blind = activity and cfg.get("fixAccount", True) and any(
+                    c[0] == "?" for c in changes)
                 note_traffic("filtered", attrs.get("user.email"),
                              detail="отфильтровано (аккаунт не в списке): "
                                     + (", ".join(seen) or "аккаунт не найден"),
-                             activity=activity)
+                             activity=activity, blind=blind)
                 if cfg.get("logTelemetry", True):
                     log_line("ПРОПУЩЕНО %s: аккаунт != '%s' (в телеметрии: %s)"
                              % (self.path, acct, ", ".join(seen) or "не найден"))
@@ -2027,9 +2052,25 @@ def tray_main():
 
         run_on_main(apply)
 
+    def check_health(icon):
+        """Оповещает, когда своя же работа режется вслепую.
+
+        Сегодняшний сбой (индекс сессий обнулился на обновлении Claude) выглядел
+        как «аккаунт молчит»: рабочие пакеты шли, но владельца определить не
+        удавалось, подпись оставалась чужой и фильтр их отбрасывал. Молчать про
+        это нельзя — телеметрия теряется, а по значку не отличить от простоя."""
+        st = PROXY_STATE
+        since = st["blind_since"]
+        if since and not st["blind_warned"] and time.monotonic() - since > 120:
+            st["blind_warned"] = True
+            notify(icon, "Телеметрия режется, но владелец сессии не определяется "
+                         "— похоже, обновился Claude. Перезапусти Claude, а если "
+                         "не поможет — трей.")
+
     def monitor(icon):
         while True:
             update_now(icon)
+            check_health(icon)
             # ждём либо события от прокси, либо таймера: событие даёт мгновенную
             # реакцию на трафик, таймер — срабатывание выдержек и вкл/выкл
             STATE_CHANGED.wait(REFRESH_INTERVAL)

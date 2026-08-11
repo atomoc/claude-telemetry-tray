@@ -118,33 +118,67 @@ SUSP_CMD = [
 EXTERNAL_URL = re.compile(r"(?i)https?://(?!(127\.0\.0\.1|localhost|0\.0\.0\.0|::1)\b)[\w.-]+")
 
 
+# Инструменты поиска: их аргумент — это шаблон поиска, а не доступ к файлу.
+# grep "password" ничего не читает из секрета, флагать такое — только шум.
+SEARCH_TOOLS = re.compile(r"(?i)^\s*(sudo\s+)?(grep|rg|ripgrep|ack|ag|findstr|"
+                          r"Select-String|git\s+grep)\b")
+
+# Работа над самим наблюдателем/треем — не подозрительная активность.
+SELF_REPO = re.compile(r"(?i)(claude-agent-monitor|claude-telemetry-tray|"
+                       r"[/\\]claude-telemetry([/\\]|\b))")
+
+
+def strip_noise(cmd):
+    """Убирает из команды куски, где «опасные» слова — это текст, а не действие:
+    тела heredoc и сообщения коммита (git commit -m/-F). Иначе описание паттернов
+    в commit-сообщении или в heredoc ловится как атака."""
+    # heredoc: <<'EOF' ... EOF  и  << EOF ... EOF
+    def drop_heredoc(m):
+        return "<<%s %s" % (m.group(1), m.group(2))  # оставляем только маркер
+    cmd = re.sub(r"<<-?\s*'?([A-Za-z_]\w*)'?(.*?)\n\1",
+                 lambda m: "<<" + m.group(1), cmd, flags=re.S)
+    # -m "..."  и  -m '...'
+    cmd = re.sub(r"-m\s+\"(?:[^\"\\]|\\.)*\"", "-m <msg>", cmd)
+    cmd = re.sub(r"-m\s+'(?:[^'\\]|\\.)*'", "-m <msg>", cmd)
+    return cmd
+
+
 def classify(tool, tin):
     """Возвращает (level, [сообщения])."""
     findings = []
     # аргументы файловых инструментов
     path = ""
-    for k in ("file_path", "path", "notebook_path", "pattern"):
+    keys = ["file_path", "path", "notebook_path"]
+    # у Glob pattern — это путь-glob (можно искать ключи: **/.ssh/*), а у Grep
+    # pattern — регэксп по содержимому, путём его считать нельзя
+    if tool == "Glob":
+        keys.append("pattern")
+    for k in keys:
         v = tin.get(k)
         if isinstance(v, str):
             path += " " + v
-    if path and SENSITIVE_PATH.search(path):
+    # чтение/правка самого наблюдателя или трея — не тревога
+    if path and SENSITIVE_PATH.search(path) and not SELF_REPO.search(path):
         findings.append(("alert", "%s → чувствительный путь: %s"
                          % (tool, path.strip()[:150])))
 
     # команды
     cmd = tin.get("command")
     if isinstance(cmd, str) and cmd:
-        for name, rx in SUSP_CMD:
-            if rx.search(cmd):
-                findings.append(("alert", "%s: %s — %s"
-                                 % (tool, name, cmd.strip()[:150])))
-        if SENSITIVE_PATH.search(cmd):
-            findings.append(("alert", "%s читает/трогает секретный путь: %s"
-                             % (tool, cmd.strip()[:150])))
-        m = EXTERNAL_URL.search(cmd)
-        if m:
-            findings.append(("warn", "%s обращается наружу: %s"
-                             % (tool, cmd.strip()[:150])))
+        # поиск по паттерну и работа над этим репо — не действие с секретом
+        if not SEARCH_TOOLS.search(cmd) and not SELF_REPO.search(cmd):
+            scan = strip_noise(cmd)   # без тел heredoc и текста commit-сообщений
+            for name, rx in SUSP_CMD:
+                if rx.search(scan):
+                    findings.append(("alert", "%s: %s — %s"
+                                     % (tool, name, cmd.strip()[:150])))
+            if SENSITIVE_PATH.search(scan):
+                findings.append(("alert", "%s читает/трогает секретный путь: %s"
+                                 % (tool, cmd.strip()[:150])))
+            m = EXTERNAL_URL.search(scan)
+            if m:
+                findings.append(("warn", "%s обращается наружу: %s"
+                                 % (tool, cmd.strip()[:150])))
     return findings
 
 

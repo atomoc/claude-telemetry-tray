@@ -194,11 +194,22 @@ def main():
 
     # «пульс»: отметка последнего вызова хука. Позволяет проверить, что хук
     # вообще срабатывает (в десктоп-агенте это не самоочевидно), не засоряя лог.
+    # Пишем cwd и сессию — так видно, какой именно инстанс Claude сработал.
     try:
+        cwd = payload.get("cwd") or "?"
+        sess = (payload.get("session_id") or "?")[:8]
         d = log_dir(); os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "agent-monitor-lastfired.txt"), "w",
-                  encoding="utf-8") as f:
-            f.write("%s  %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tool))
+        hb = os.path.join(d, "agent-monitor-lastfired.txt")
+        line = "%s  %-6s sess=%s  cwd=%s\n" % (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tool, sess, cwd)
+        old = ""
+        try:
+            with open(hb, encoding="utf-8") as f:
+                old = "".join(f.readlines()[-49:])   # держим последние ~50 строк
+        except OSError:
+            pass
+        with open(hb, "w", encoding="utf-8") as f:
+            f.write(old + line)
     except Exception:
         pass
 

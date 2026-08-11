@@ -27,6 +27,7 @@ import re
 import sys
 import glob
 import json
+import hashlib
 import time
 import shlex
 import shutil
@@ -46,7 +47,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.24"
+__version__ = "3.25"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -82,6 +83,9 @@ PROXY_STATE = {
     "accounts": {},          # email → {ok, filtered, last, at}
     "blind_since": 0.0,      # с какого момента режем работу с неопознанным владельцем
     "blind_warned": False,   # чтобы не спамить оповещением
+    "leaks": 0,              # сколько раз секрет замечен в исходящей телеметрии
+    "leak_seen": set(),      # отпечатки уже замеченных секретов (без дедупа спамило бы)
+    "leak_alerts": [],       # очередь уведомлений для monitor-потока
 }
 STALE_AFTER = 300            # сек без успешной доставки → «трафика нет»
 
@@ -820,6 +824,62 @@ WORK_EVENTS = ("user_prompt", "api_request", "assistant_response",
                "tool_decision", "tool_result", "hook_execution")
 
 
+# ── Сканер утечек в исходящей телеметрии ─────────────────────────────────────
+# Проверяем ровно то, что уходит на коллектор. Реакция — только лог и
+# уведомление: ничего не режем, чтобы не потерять легитимную телеметрию из-за
+# ложного совпадения, но факт утечки виден сразу, а не постфактум в логе.
+SECRET_PATTERNS = [
+    ("приватный ключ",  re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("ssh-ключ",        re.compile(r"ssh-(?:rsa|ed25519|dss)\s+[A-Za-z0-9+/]{40,}")),
+    ("AWS access key",  re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("токен GitHub",    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
+    ("токен Slack",     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("ключ OpenAI/ant", re.compile(r"(?:sk|sk-ant)-[A-Za-z0-9_\-]{20,}")),
+    ("Bearer-токен",    re.compile(r"(?i)Bearer[ ]+[A-Za-z0-9._\-]{20,}")),
+    ("JWT",             re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
+    ("пароль в тексте", re.compile(r"(?i)(?:password|passwd|pwd|пароль)\s*[:=]\s*\S{4,}")),
+    ("секрет=…",        re.compile(r"(?i)(?:secret|api[_-]?key|token)\s*[:=]\s*\S{12,}")),
+]
+
+
+def scan_secrets(text):
+    """[(категория, отпечаток)] найденных секретов. Отпечаток — не сам секрет,
+    а его хеш: в лог и уведомление сам секрет не кладём."""
+    out = []
+    for name, rx in SECRET_PATTERNS:
+        for m in rx.finditer(text):
+            frag = m.group(0)
+            fp = hashlib.sha1(frag.encode("utf-8", "replace")).hexdigest()[:10]
+            out.append((name, fp))
+    return out
+
+
+def check_leak(body_bytes, path, email):
+    """Сканирует пересылаемое тело; новые находки — в лог и в очередь уведомлений."""
+    try:
+        text = body_bytes.decode("utf-8", "replace")
+    except Exception:
+        return
+    hits = scan_secrets(text)
+    if not hits:
+        return
+    st = PROXY_STATE
+    fresh = []
+    for name, fp in hits:
+        if fp in st["leak_seen"]:
+            continue
+        st["leak_seen"].add(fp)
+        fresh.append(name)
+    st["leaks"] += len(hits)
+    if fresh:
+        log_line("ВОЗМОЖНАЯ УТЕЧКА %s [%s]: %s (уходит на коллектор)"
+                 % (path, email or "?", ", ".join(sorted(set(fresh)))))
+        st["leak_alerts"].append(
+            "Похоже на секрет в телеметрии (%s), уже ушёл на коллектор. "
+            "Проверь лог и подумай про logUserPrompts." % ", ".join(sorted(set(fresh))))
+        STATE_CHANGED.set()
+
+
 def payload_has_activity(body_bytes):
     """True, если в пакете есть работа, а не периодический экспорт по таймеру.
 
@@ -979,6 +1039,8 @@ def _make_handler():
                              % (self.path, acct, ", ".join(seen) or "не найден"))
                 self._reply(200)  # говорим Claude "ок", но НЕ пересылаем
                 return
+
+            check_leak(body, self.path, attrs.get("user.email"))
 
             base = cfg.get("base", "").rstrip("/")
             upstream = base + self.path
@@ -2060,6 +2122,8 @@ def tray_main():
         удавалось, подпись оставалась чужой и фильтр их отбрасывал. Молчать про
         это нельзя — телеметрия теряется, а по значку не отличить от простоя."""
         st = PROXY_STATE
+        while st["leak_alerts"]:
+            notify(icon, st["leak_alerts"].pop(0))
         since = st["blind_since"]
         if since and not st["blind_warned"] and time.monotonic() - since > 120:
             st["blind_warned"] = True

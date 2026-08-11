@@ -87,8 +87,8 @@ def notify_tray(level, message):
 # ── Правила ──────────────────────────────────────────────────────────────────
 # Чувствительные пути: обращение к ним любым файловым инструментом — тревога.
 SENSITIVE_PATH = re.compile(r"""(?ix)
-      \.ssh(/|\\|$)              # приватные ключи ssh
-    | id_rsa | id_ed25519 | \.pem\b | \.p12\b | \.pfx\b
+      \.ssh[/\\](?!config\b|known_hosts\b)[^\s'"]   # файлы в ~/.ssh, кроме config/known_hosts
+    | id_rsa | id_ed25519 | id_ecdsa | id_dsa | \.pem\b | \.p12\b | \.pfx\b | \.key\b
     | \.aws(/|\\)               | \.gnupg(/|\\)
     | \.config[/\\]gcloud       | \.kube[/\\]config
     | \.netrc | \.pgpass
@@ -108,7 +108,7 @@ SUSP_CMD = [
     ("netcat",                 re.compile(r"(?i)\b(nc|ncat|netcat)\b\s+-")),
     ("PowerShell -EncodedCommand", re.compile(r"(?i)-e(nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{20,}")),
     ("certutil/bitsadmin загрузка", re.compile(r"(?i)\b(certutil|bitsadmin)\b.*(urlcache|http)")),
-    ("чтение приватного ключа", re.compile(r"(?i)(cat|type|Get-Content)\b.*(id_rsa|\.pem|\.ssh)")),
+    ("чтение приватного ключа", re.compile(r"(?i)(cat|type|Get-Content)\b.*(id_rsa|id_ed25519|id_ecdsa|\.pem\b|\.p12\b|\.key\b|\.ssh[/\\](?!config\b|known_hosts\b))")),
     ("git remote add",         re.compile(r"(?i)git\s+remote\s+add\b")),
     ("scp/rsync наружу",       re.compile(r"(?i)\b(scp|rsync)\b.*@[\w.-]+:")),
     ("выгрузка окружения",     re.compile(r"(?i)(printenv|(^|\s)env\s*$|Get-ChildItem\s+Env:).*\|\s*(curl|nc|wget)")),

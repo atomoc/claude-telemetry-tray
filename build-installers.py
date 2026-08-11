@@ -28,6 +28,7 @@ FOLDER = "claude-telemetry"
 # Files bundled into the installer payload (only those that exist are included).
 PAYLOAD_FILES = [
     "claude-telemetry-tray.py",
+    "claude-agent-monitor.py",
     "start-tray-windows.bat",
     "start-tray-windows-silent.bat",
     "start-tray-windows.vbs",

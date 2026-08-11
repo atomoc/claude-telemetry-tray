@@ -47,7 +47,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.26"
+__version__ = "3.27"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -180,6 +180,56 @@ def user_file():
     if os.environ.get("CT_USER"):
         return os.environ["CT_USER"]
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+
+
+# ── Наблюдатель за действиями агента (хук Claude Code) ────────────────────────
+def monitor_script():
+    """Путь к claude-agent-monitor.py рядом с треем (кладётся установщиком)."""
+    return os.path.join(os.path.dirname(SCRIPT), "claude-agent-monitor.py")
+
+
+def monitor_hook_cmd():
+    py = sys.executable or "python"
+    # трей запущен под pythonw.exe (без консоли); для хука берём обычный python
+    if py.lower().endswith("pythonw.exe"):
+        cand = py[:-len("pythonw.exe")] + "python.exe"
+        if os.path.isfile(cand):
+            py = cand
+    return '"%s" "%s"' % (py, monitor_script())
+
+
+def monitor_enabled():
+    """True, если наш хук уже прописан в settings.json."""
+    s = read_json(user_file()) or {}
+    for e in (s.get("hooks", {}) or {}).get("PreToolUse", []) or []:
+        for h in e.get("hooks", []) or []:
+            if "claude-agent-monitor" in (h.get("command") or ""):
+                return True
+    return False
+
+
+def set_monitor(on):
+    """Регистрирует или убирает хук-наблюдатель, не трогая остальной settings.json."""
+    p = user_file()
+    s = read_json(p) or {}
+    hooks = s.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    # выкидываем прежнюю запись наблюдателя (путь мог измениться)
+    pre = [e for e in pre
+           if not any("claude-agent-monitor" in (h.get("command") or "")
+                      for h in e.get("hooks", []) or [])]
+    if on:
+        pre.append({"matcher": "*", "hooks": [
+            {"type": "command", "command": monitor_hook_cmd()}]})
+    hooks["PreToolUse"] = pre
+    if not pre:
+        hooks.pop("PreToolUse", None)
+    if not hooks:
+        s.pop("hooks", None)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
 
 def config_path():
@@ -2217,6 +2267,22 @@ def tray_main():
             notify(icon, "Не удалось изменить автозапуск: %s" % e)
         icon.update_menu()
 
+    def act_monitor(icon, item):
+        want = not monitor_enabled()
+        if want and not os.path.isfile(monitor_script()):
+            notify(icon, "Файл наблюдателя не найден рядом с треем:\n"
+                         + monitor_script())
+            return
+        try:
+            set_monitor(want)
+        except Exception as e:
+            notify(icon, "Не удалось изменить слежку: %s" % e)
+            return
+        icon.update_menu()
+        notify(icon, "Слежка за действиями Claude включена — перезапусти Claude, "
+                     "чтобы хук загрузился." if want
+               else "Слежка за действиями Claude выключена.")
+
     def act_status(icon, item):
         notify(icon, status_text() + "\n\nДоставка: " + PROXY_STATE.get("detail", "—"))
 
@@ -2239,6 +2305,8 @@ def tray_main():
         MenuItem("Настройки…", act_settings),
         MenuItem("Запуск вместе с системой", act_autostart,
                  checked=lambda i: autostart_enabled()),
+        MenuItem("Следить за действиями Claude", act_monitor,
+                 checked=lambda i: monitor_enabled()),
         MenuItem("Состояние", act_status),
         MenuItem("Выход", act_quit),
         MenuItem("dblclick-open-settings", act_double, default=True, visible=False),

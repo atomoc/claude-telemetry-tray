@@ -14,11 +14,14 @@ import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "claude-telemetry-tray.py")
+MON = os.path.join(HERE, "claude-agent-monitor.py")
 OUT = os.path.join(HERE, "dist", "claude-telemetry-macos.command")
 DELIM = "__CTT_PAYLOAD_EOF__"
+MON_DELIM = "__CTT_MONITOR_EOF__"
 
 payload = open(SRC, "r", encoding="utf-8").read()
-if DELIM in payload:
+monitor = open(MON, "r", encoding="utf-8").read()
+if DELIM in payload or MON_DELIM in payload or MON_DELIM in monitor:
     raise SystemExit("delimiter collision in payload")
 
 HEAD = r'''#!/bin/bash
@@ -30,13 +33,19 @@ APP="$HOME/Library/Application Support/claude-telemetry"
 VENV="$APP/venv"
 PY="$VENV/bin/python3"
 SCRIPT="$APP/claude-telemetry-tray.py"
+MONITOR="$APP/claude-agent-monitor.py"
 mkdir -p "$APP"
 
 echo "Распаковываю…"
 cat > "$SCRIPT" <<'__CTT_PAYLOAD_EOF__'
 '''
 
-TAIL = r'''__CTT_PAYLOAD_EOF__
+MID = r'''__CTT_PAYLOAD_EOF__
+
+cat > "$MONITOR" <<'__CTT_MONITOR_EOF__'
+'''
+
+TAIL = r'''__CTT_MONITOR_EOF__
 
 if [ ! -x "$PY" ]; then
   echo "Готовлю окружение (это нужно один раз)…"
@@ -70,12 +79,15 @@ else
 fi
 '''
 
-# payload guaranteed to end with newline so the closing delimiter sits on its own line
+# каждый payload оканчиваем переводом строки, чтобы закрывающий разделитель
+# heredoc стоял на своей строке
 if not payload.endswith("\n"):
     payload += "\n"
+if not monitor.endswith("\n"):
+    monitor += "\n"
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, "w", encoding="utf-8") as f:
-    f.write(HEAD + payload + TAIL)
+    f.write(HEAD + payload + MID + monitor + TAIL)
 os.chmod(OUT, 0o755)
 print("built:", OUT, "(%d bytes)" % os.path.getsize(OUT))

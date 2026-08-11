@@ -36,6 +36,12 @@ This project is the opposite: a **single-file desktop utility** for people who j
 ## Features
 
 - 🖥️ **System-tray UI** (Windows / macOS / Linux) — enable/disable, settings, status.
+- 🔎 **Leak & agent watch** — every forwarded body is scanned for secrets (private keys,
+  tokens, passwords) and flagged, never blocked. Enable **Следить за действиями Claude** in
+  the tray to also register a Claude Code hook (`claude-agent-monitor.py`) that logs
+  suspicious tool use — reads of `.ssh`/`.env`/credential stores, `curl … | sh`,
+  `powershell -enc`, exfiltration shapes — to `security-monitor.log` and the tray. Both
+  layers only log and notify. See [monitoring](#monitoring--leak-detection).
 - 🔌 **Local logging proxy** — telemetry always flows through `127.0.0.1:<port>`; the proxy
   records each real request body and forwards it upstream.
 - 🧾 **Plain-text log** of everything actually sent (with rotation).
@@ -203,6 +209,35 @@ arrived with — it is never forwarded "just in case".
 
 > Note: telemetry is enabled through Claude Code **managed settings** (system-wide, requires
 > admin once) — per-user settings do not enable Claude Code telemetry, so this is the only mode.
+
+## Monitoring & leak detection
+
+Two independent layers, both **log and notify only — nothing is ever blocked**, so no
+legitimate work is lost to a false positive.
+
+**1. Secrets in outgoing telemetry (built into the tray).** Before forwarding any body to
+your collector, the proxy scans it for secret shapes: private/ssh keys, AWS/GitHub/Slack/
+OpenAI tokens, Bearer tokens, JWTs, `password=`/`secret=` assignments. A match is written to
+the telemetry log as `ВОЗМОЖНАЯ УТЕЧКА` and raised as a tray notification. Only a category
+and a hash are recorded — never the secret itself — and findings are deduplicated. Always on.
+
+**2. Agent actions (opt-in Claude Code hook).** Turn on **Следить за действиями Claude** in
+the tray menu: it registers `claude-agent-monitor.py` as a `PreToolUse` hook in
+`~/.claude/settings.json` (your other settings are left untouched). Before each tool call the
+hook flags — without blocking — reads/edits of sensitive paths (`.ssh`, `.aws`, `.env`, keys,
+browser credential stores, `/etc/shadow`, registry hives, wallets) and shell commands with
+exfiltration or evasion shapes (`curl … | sh`, `base64 -d | sh`, `/dev/tcp`, netcat,
+`powershell -enc`, `certutil` download, `git remote add`, `scp`/`rsync` to an external host,
+reaching a non-local URL). Findings go to `security-monitor.log` (next to the telemetry log)
+and, for the serious ones, to the tray. Commit messages, heredoc bodies, search-tool patterns
+and work on the monitor's own repo are stripped to keep the noise down. The hook takes effect
+**after the next Claude restart**; a heartbeat file `agent-monitor-lastfired.txt` lets you
+confirm it is actually firing (the desktop agent does honor user hooks, but it is worth
+checking).
+
+**Scope, honestly:** the tray only sees Claude's OpenTelemetry export, and the hook only sees
+the agent's tool calls. Neither sees Claude's API traffic, MCP traffic, or any other network
+egress — that would need a separate network layer.
 
 ## File locations
 

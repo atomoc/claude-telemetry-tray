@@ -47,7 +47,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.25"
+__version__ = "3.26"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -1108,7 +1108,33 @@ def _make_handler():
             finally:
                 http.server.BaseHTTPRequestHandler.finish(self)
 
-        do_POST = _forward
+        def _monitor(self):
+            """Приём тревог от внешнего наблюдателя (хук Claude Code).
+
+            Хук за действиями агента живёт отдельным процессом и шлёт сюда
+            находки, чтобы уведомление шло через тот же трей, а не заводить
+            второй механизм оповещений."""
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                ev = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:
+                self._reply(400, b"bad json")
+                return
+            msg = str(ev.get("message") or "").strip()[:300]
+            level = str(ev.get("level") or "info")
+            if msg:
+                log_line("ДЕЙСТВИЕ АГЕНТА [%s]: %s" % (level, msg))
+                if level in ("warn", "alert"):
+                    PROXY_STATE["leak_alerts"].append("Claude: " + msg)
+                    STATE_CHANGED.set()
+            self._reply(200)
+
+        def do_POST(self):
+            if self.path.rstrip("/") == "/monitor":
+                self._monitor()
+            else:
+                self._forward()
 
         def log_message(self, *a):
             pass

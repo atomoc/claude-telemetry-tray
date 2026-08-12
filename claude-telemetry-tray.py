@@ -47,7 +47,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.30"
+__version__ = "3.31"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -1183,7 +1183,11 @@ def _make_handler():
             level = str(ev.get("level") or "info")
             if msg:
                 log_line("ДЕЙСТВИЕ АГЕНТА [%s]: %s" % (level, msg))
-                if level in ("warn", "alert"):
+                # Всплывашка только на серьёзное (alert): секретные пути,
+                # скачать-и-запустить, эксфильтрация. Простое обращение наружу
+                # (warn) — это любой git/curl/pip/yt_dlp, оно шумит; оставляем
+                # его следом в логе, но не дёргаем уведомлением.
+                if level == "alert":
                     PROXY_STATE["leak_alerts"].append("Claude: " + msg)
                     STATE_CHANGED.set()
             self._reply(200)

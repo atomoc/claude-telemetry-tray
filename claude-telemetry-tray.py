@@ -47,7 +47,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.31"
+__version__ = "3.32"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -83,6 +83,7 @@ PROXY_STATE = {
     "accounts": {},          # email → {ok, filtered, last, at}
     "blind_since": 0.0,      # с какого момента режем работу с неопознанным владельцем
     "blind_warned": False,   # чтобы не спамить оповещением
+    "started_at": 0.0,      # монотонное время старта — для защиты от циклов перезапуска
     "leaks": 0,              # сколько раз секрет замечен в исходящей телеметрии
     "leak_seen": set(),      # отпечатки уже замеченных секретов (без дедупа спамило бы)
     "leak_alerts": [],       # очередь уведомлений для monitor-потока
@@ -1205,6 +1206,7 @@ def _make_handler():
 
 
 def start_proxy():
+    PROXY_STATE["started_at"] = time.monotonic()
     cfg = load_config()
     if cfg.get("fixAccount", True):
         emails = dict(cfg.get("accountEmails") or {})
@@ -2130,6 +2132,35 @@ def compute_state():
     return "waiting"
 
 
+def _fresh_process_sees_sessions():
+    """True, если только что запущенный процесс тем же кодом видит сессии.
+    Отличает «нас заклинило» от «сессий действительно нет»."""
+    try:
+        out = subprocess.run(
+            [sys.executable, SCRIPT, "--count-sessions"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        return int((out or "0").strip() or "0") > 0
+    except Exception:
+        return False
+
+
+def restart_self():
+    """Перезапускает трей новым процессом и завершает текущий."""
+    try:
+        flags = 0
+        if SYS == "Windows":
+            flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        subprocess.Popen([sys.executable, SCRIPT],
+                         creationflags=flags, close_fds=True)
+    except Exception:
+        log_line("АВТО-ПЕРЕЗАПУСК не удался:" + chr(10) + traceback.format_exc())
+        return
+    time.sleep(1)
+    os._exit(0)   # жёстко: наш процесс всё равно деградировал
+
+
 def tray_main():
     if not ensure_tray_deps():
         if SYS == "Darwin":
@@ -2216,8 +2247,20 @@ def tray_main():
         if since and not st["blind_warned"] and time.monotonic() - since > 120:
             st["blind_warned"] = True
             notify(icon, "Телеметрия режется, но владелец сессии не определяется "
-                         "— похоже, обновился Claude. Перезапусти Claude, а если "
-                         "не поможет — трей.")
+                         "— похоже, обновился Claude или ПК выходил из сна. "
+                         "Пробую восстановиться сам.")
+        # Авто-перезапуск: если свою работу режем вслепую дольше 5 минут, значит
+        # сброс кэшей не помог — процесс заклинило (после суток работы и снов у
+        # него деградируют файловый обход и запуск подпроцессов, свежий при этом
+        # работает). Единственное надёжное лечение — перезапуститься. Делаем это
+        # только когда проба подтверждает, что сессии на диске есть, иначе можно
+        # уйти в цикл перезапусков на пустом месте.
+        if (since and time.monotonic() - since > 300
+                and time.monotonic() - PROXY_STATE["started_at"] > 600):
+            if _fresh_process_sees_sessions():
+                log_line("АВТО-ПЕРЕЗАПУСК: работа режется вслепую >5 мин, а свежий "
+                         "процесс сессии видит — перезапускаюсь")
+                restart_self()
 
     def monitor(icon):
         while True:
@@ -2396,6 +2439,15 @@ def main():
         return
     if "--settings" in args:
         run_settings_window()
+        return
+    if "--count-sessions" in args:
+        # проба здоровья: свежий процесс печатает, сколько сессий он видит.
+        # Ею пользуется авто-перезапуск, чтобы отличить «процесс заклинило»
+        # (свежий видит, а рабочий нет) от «сессий правда нет».
+        try:
+            print(len(_scan_sessions()))
+        except Exception:
+            print(-1)
         return
     if "--status" in args:
         print(status_text())

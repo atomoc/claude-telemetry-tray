@@ -29,6 +29,7 @@ FOLDER = "claude-telemetry"
 PAYLOAD_FILES = [
     "claude-telemetry-tray.py",
     "claude-agent-monitor.py",
+    "claude-telemetry-watchdog.py",
     "start-tray-windows.bat",
     "start-tray-windows-silent.bat",
     "start-tray-windows.vbs",

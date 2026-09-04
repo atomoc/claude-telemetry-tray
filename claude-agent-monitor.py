@@ -86,13 +86,15 @@ def notify_tray(level, message):
 
 # ── Правила ──────────────────────────────────────────────────────────────────
 # Чувствительные пути: обращение к ним любым файловым инструментом — тревога.
+# Только настоящий секретный материал. Шаблоны (.env.example), публичные ключи
+# (.pub), ssh config и known_hosts — не секреты, их чтение рутинно и не флагается.
 SENSITIVE_PATH = re.compile(r"""(?ix)
-      \.ssh[/\\](?!config\b|known_hosts\b)[^\s'"]   # файлы в ~/.ssh, кроме config/known_hosts
-    | id_rsa | id_ed25519 | id_ecdsa | id_dsa | \.pem\b | \.p12\b | \.pfx\b | \.key\b
+      (id_rsa|id_ed25519|id_ecdsa|id_dsa)(?!\.pub)   # приватные ключи, но не .pub
+    | \.pem\b | \.p12\b | \.pfx\b | \.key\b
     | \.aws(/|\\)               | \.gnupg(/|\\)
     | \.config[/\\]gcloud       | \.kube[/\\]config
     | \.netrc | \.pgpass
-    | (^|/|\\)\.env(\.|$)        # .env с секретами
+    | (^|[/\\])\.env(?!\.(example|sample|template|dist|ci)\b)(\.[\w]+)?(?=$|['"\s])  # .env, но не шаблоны
     | credentials(\.json)?\b    | secrets?\.(json|ya?ml|txt)\b
     | /etc/shadow | /etc/sudoers
     | NTUSER\.DAT | \\SAM$ | \\SECURITY$   # кусты реестра Windows
@@ -108,7 +110,7 @@ SUSP_CMD = [
     ("netcat",                 re.compile(r"(?i)\b(nc|ncat|netcat)\b\s+-")),
     ("PowerShell -EncodedCommand", re.compile(r"(?i)-e(nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{20,}")),
     ("certutil/bitsadmin загрузка", re.compile(r"(?i)\b(certutil|bitsadmin)\b.*(urlcache|http)")),
-    ("чтение приватного ключа", re.compile(r"(?i)(cat|type|Get-Content)\b.*(id_rsa|id_ed25519|id_ecdsa|\.pem\b|\.p12\b|\.key\b|\.ssh[/\\](?!config\b|known_hosts\b))")),
+    ("чтение приватного ключа", re.compile(r"(?i)(cat|type|Get-Content)\b[^|;&\n]*((id_rsa|id_ed25519|id_ecdsa)(?!\.pub)|\.pem\b|\.p12\b|\.key\b)")),
     ("git remote add",         re.compile(r"(?i)git\s+remote\s+add\b")),
     ("scp/rsync наружу",       re.compile(r"(?i)\b(scp|rsync)\b.*@[\w.-]+:")),
     ("выгрузка окружения",     re.compile(r"(?i)(printenv|(^|\s)env\s*$|Get-ChildItem\s+Env:).*\|\s*(curl|nc|wget)")),

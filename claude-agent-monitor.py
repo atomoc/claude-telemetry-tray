@@ -94,7 +94,6 @@ SENSITIVE_PATH = re.compile(r"""(?ix)
     | \.aws(/|\\)               | \.gnupg(/|\\)
     | \.config[/\\]gcloud       | \.kube[/\\]config
     | \.netrc | \.pgpass
-    | (^|[/\\])\.env(?!\.(example|sample|template|dist|ci)\b)(\.[\w]+)?(?=$|['"\s])  # .env, но не шаблоны
     | credentials(\.json)?\b    | secrets?\.(json|ya?ml|txt)\b
     | /etc/shadow | /etc/sudoers
     | NTUSER\.DAT | \\SAM$ | \\SECURITY$   # кусты реестра Windows
@@ -112,6 +111,8 @@ SUSP_CMD = [
     ("certutil/bitsadmin загрузка", re.compile(r"(?i)\b(certutil|bitsadmin)\b.*(urlcache|http)")),
     ("чтение приватного ключа", re.compile(r"(?i)(cat|type|Get-Content)\b[^|;&\n]*((id_rsa|id_ed25519|id_ecdsa)(?!\.pub)|\.pem\b|\.p12\b|\.key\b)")),
     ("git remote add",         re.compile(r"(?i)git\s+remote\s+add\b")),
+    # .env читать/запускать — рутина; тревога только если его ВЫГРУЖАЮТ наружу
+    ("выгрузка .env наружу",   re.compile(r"(?i)(\.env\b[^|;&\n]*\|[^|;&\n]*(curl|nc|ncat|wget|base64)|(curl|wget|scp|rsync|nc)\b[^|;&\n]*\.env\b)")),
     ("scp/rsync наружу",       re.compile(r"(?i)\b(scp|rsync)\b.*@[\w.-]+:")),
     ("выгрузка окружения",     re.compile(r"(?i)(printenv|(^|\s)env\s*$|Get-ChildItem\s+Env:).*\|\s*(curl|nc|wget)")),
 ]

@@ -85,15 +85,40 @@ def looks_wedged(window_min=7):
     return last_healthy is None or last_healthy < last_empty
 
 
+import re as _re
+_UUID = _re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", _re.I)
+
+
 def sessions_exist():
-    try:
-        out = subprocess.run(
-            [PYW, TRAY, "--count-sessions"],
-            capture_output=True, text=True, timeout=60,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-        return int((out or "0").strip() or "0") > 0
-    except Exception:
-        return False
+    """Есть ли на диске сессии Claude. Проверяем сами, прямо по файловой
+    системе, а не через подпроцесс: запуск pythonw под планировщиком иногда
+    возвращал 0 (таймаут/окружение), и сторож ошибочно решал не перезапускать
+    заклиненный трей. Прямая проверка от этого не зависит."""
+    home = os.path.expanduser("~")
+    bases = [os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA"),
+             os.path.join(home, "AppData", "Roaming"),
+             os.path.join(home, "AppData", "Local")]
+    seen = set()
+    for base in bases:
+        if not base or base in seen or not os.path.isdir(base):
+            continue
+        seen.add(base)
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        for name in names:
+            if "claude" not in name.lower():
+                continue
+            for store in ("claude-code-sessions", "local-agent-mode-sessions"):
+                d = os.path.join(base, name, store)
+                try:
+                    for acct in os.listdir(d):
+                        if _UUID.match(acct):
+                            return True   # есть папка аккаунта с сессиями
+                except OSError:
+                    continue
+    return False
 
 
 def tray_pids():

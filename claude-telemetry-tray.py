@@ -47,7 +47,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.37"
+__version__ = "3.38"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -597,6 +597,53 @@ def session_owner(session_id):
     return _SESS_CACHE["map"].get(session_id)
 
 
+def _empty_index_diagnostics():
+    """Снимок того, что процесс РЕАЛЬНО видит на диске, когда индекс пуст.
+
+    Пишется только при пустом индексе (раз в 5 мин), поэтому в норме не стоит
+    ничего. Нужен, чтобы поймать причину клина: свежий процесс каталоги видит,
+    а заклинивший — нет; здесь фиксируем, что именно возвращает os.listdir в
+    самом заклинившем процессе (в т.ч. пойманную ошибку), а не гадаем."""
+    out = ["ДИАГНОСТИКА пустого индекса:"]
+    home = os.path.expanduser("~")
+    out.append("  ~=%s  APPDATA=%s  LOCALAPPDATA=%s"
+               % (home, os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")))
+    if SYS == "Windows":
+        bases = [os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")]
+    elif SYS == "Darwin":
+        bases = [os.path.join(home, "Library", "Application Support")]
+    else:
+        bases = [os.path.join(home, ".config"), os.path.join(home, ".local", "share")]
+    for base in bases:
+        if not base:
+            out.append("  база=<не задана>")
+            continue
+        try:
+            names = os.listdir(base)
+            claude = [n for n in names if "claude" in n.lower()]
+            out.append("  база %s: всего %d, claude-папок %d: %s"
+                       % (base, len(names), len(claude), ", ".join(claude) or "нет"))
+            for n in claude:
+                for store in ("claude-code-sessions", "local-agent-mode-sessions"):
+                    d = os.path.join(base, n, store)
+                    if not os.path.isdir(d):
+                        continue
+                    try:
+                        accts = os.listdir(d)
+                        out.append("    %s\\%s: аккаунтов %d" % (n, store, len(accts)))
+                    except OSError as e:
+                        out.append("    %s\\%s: os.listdir ОШИБКА %s: %s"
+                                   % (n, store, e.__class__.__name__, e))
+        except OSError as e:
+            out.append("  база %s: os.listdir ОШИБКА %s: %s"
+                       % (base, e.__class__.__name__, e))
+    try:
+        out.append("  claude_data_roots()=%s" % (claude_data_roots() or "пусто"))
+    except Exception as e:
+        out.append("  claude_data_roots() ОШИБКА %s: %s" % (e.__class__.__name__, e))
+    return chr(10).join(out)
+
+
 def _session_index_loop():
     """Фоновое обновление индекса сессий.
 
@@ -640,6 +687,7 @@ def _session_index_loop():
                     _SESS_CACHE["warned"] = now
                     log_line("ВНИМАНИЕ: индекс сессий пуст — владелец сессии не "
                              "проверяется, телеметрия судится по исходной подписи")
+                    log_line(_empty_index_diagnostics())
         except Exception:
             # поток обязан пережить любую ошибку: без него подпись не чинится
             log_line("индекс сессий: сбой обхода:" + chr(10)

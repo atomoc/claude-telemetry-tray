@@ -155,13 +155,43 @@ def restart_tray():
         wlog("не смог запустить трей: %s" % e.__class__.__name__)
 
 
+RESTART_STAMP = "watchdog-last-restart.txt"
+MIN_RESTART_GAP = 900   # сек между перезапусками — защита от циклов
+
+
+def _last_restart_age():
+    """Сколько секунд назад сторож в последний раз перезапускал трей (или большое
+    число, если никогда). Метка на диске, т.к. сторож между запусками stateless."""
+    p = os.path.join(data_dir(), RESTART_STAMP)
+    try:
+        return time.time() - os.path.getmtime(p)
+    except OSError:
+        return 1e9
+
+
+def _mark_restart():
+    try:
+        p = os.path.join(data_dir(), RESTART_STAMP)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write(str(time.time()))
+    except OSError:
+        pass
+
+
 def main():
     if not looks_wedged():
         return
-    if not sessions_exist():
-        wlog("индекс пуст, но и свежая проба сессий не видит — не перезапускаю")
+    # Раньше здесь была проверка sessions_exist() — но под планировщиком она
+    # видит каталоги Claude протухшими (та же виртуализация, из-за которой
+    # заклинивает и сам трей) и всегда возвращала 0, поэтому сторож НИКОГДА не
+    # перезапускал. От детекта сессий отказались; чтобы не уйти в цикл, ограничи-
+    # ваем частоту: не чаще одного перезапуска в MIN_RESTART_GAP.
+    age = _last_restart_age()
+    if age < MIN_RESTART_GAP:
+        wlog("индекс пуст, но недавно (%.0f с назад) уже перезапускал — жду" % age)
         return
-    wlog("трей заклинило (индекс пуст, а сессии на диске есть) — перезапускаю")
+    wlog("трей заклинило (индекс пуст >5 мин) — перезапускаю")
+    _mark_restart()
     restart_tray()
 
 

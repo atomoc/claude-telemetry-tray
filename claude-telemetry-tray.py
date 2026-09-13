@@ -47,7 +47,7 @@ REFRESH_INTERVAL = 5          # раз в сколько секунд переп
 # Прокси работает в своём потоке и будит перерисовку сразу, как только пришёл
 # пакет: раньше значок ждал очередного тика таймера и отставал до пяти секунд.
 STATE_CHANGED = threading.Event()
-__version__ = "3.39"
+__version__ = "3.40"
 
 TELEMETRY_KEYS = [
     "CLAUDE_CODE_ENABLE_TELEMETRY", "OTEL_LOG_USER_PROMPTS", "OTEL_METRICS_EXPORTER",
@@ -491,6 +491,21 @@ def claude_data_roots():
     home = os.path.expanduser("~")
     if SYS == "Windows":
         bases = [os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")]
+        # Claude — MSIX-приложение: свои AppData\Roaming\Claude и AppData\Local\
+        # Claude-msix* оно виртуализирует в пакетное хранилище. Процесс-потомок
+        # приложения видит их прозрачно, но трей из автозапуска/планировщика —
+        # вне MSIX-контекста и видит нативные (пустые) каталоги, отсюда клин с
+        # пустым индексом. Реальные файлы лежат в Packages\*\LocalCache\{Roaming,
+        # Local} — этот путь читается из ЛЮБОГО контекста, поэтому добавляем его.
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            for cache in glob.glob(os.path.join(local, "Packages", "*",
+                                                 "LocalCache")):
+                if "claude" not in os.path.basename(
+                        os.path.dirname(cache)).lower():
+                    continue
+                bases += [os.path.join(cache, "Roaming"),
+                          os.path.join(cache, "Local")]
     elif SYS == "Darwin":
         bases = [os.path.join(home, "Library", "Application Support")]
     else:
